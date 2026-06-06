@@ -23,13 +23,18 @@
       --blue-glow: rgba(103,168,255,0.54);
       --arrow: #626975;
       --led: 3mm;
-      --gap: 2.2mm;
+      --gap: 2.5mm;
+      --marker: 4mm;
+      --marker-gap: 4mm;
+      --pad-x: 7mm;
+      --pad-y: 7mm;
       --step: calc(var(--led) + var(--gap));
-      --pad: 7mm;
-      --grid: calc(var(--led) + var(--step) * 2);
-      --target-size: calc(var(--grid) + var(--pad) * 2);
-      --center: calc(var(--pad) + var(--step) + var(--led) / 2);
-      --chevron-offset: 4.65mm;
+      --target-width: calc(var(--pad-x) * 2 + var(--marker) * 2 + var(--marker-gap) * 2 + var(--led) * 5 + var(--gap) * 4);
+      --target-height: calc(var(--pad-y) * 2 + var(--marker));
+      --led-y: calc(var(--target-height) / 2);
+      --start-marker-x: calc(var(--pad-x) + var(--marker) / 2);
+      --first-led-x: calc(var(--pad-x) + var(--marker) + var(--marker-gap) + var(--led) / 2);
+      --end-marker-x: calc(var(--first-led-x) + var(--step) * 4 + var(--led) / 2 + var(--marker-gap) + var(--marker) / 2);
     }
 
     * {
@@ -73,7 +78,6 @@
       display: flex;
       flex-direction: column;
       gap: 24px;
-      pointer-events: none;
     }
 
     .sub {
@@ -86,12 +90,11 @@
     .controls {
       display: grid;
       gap: 16px;
-      pointer-events: auto;
     }
 
     .device {
-      width: var(--target-size);
-      height: var(--target-size);
+      width: var(--target-width);
+      height: var(--target-height);
       position: relative;
       flex: none;
       border: 1px solid var(--line);
@@ -104,8 +107,8 @@
       width: var(--led);
       height: var(--led);
       position: absolute;
-      left: calc(var(--pad) + var(--col) * var(--step) + var(--led) / 2);
-      top: calc(var(--pad) + var(--row) * var(--step) + var(--led) / 2);
+      left: calc(var(--first-led-x) + var(--index) * var(--step));
+      top: var(--led-y);
       transform: translate(-50%, -50%);
       border-radius: 50%;
       background: var(--blue);
@@ -120,53 +123,27 @@
       box-shadow: none;
     }
 
-    .arrow {
-      position: absolute;
-      width: 4.1mm;
-      height: 4.1mm;
-      overflow: visible;
-      fill: none;
-      stroke: var(--arrow);
-      stroke-width: 1.55;
-      stroke-linecap: round;
-      stroke-linejoin: round;
-      z-index: 3;
-    }
-
-    .arrow.right {
-      left: calc(var(--center) - var(--chevron-offset));
-      top: var(--center);
-      transform: translate(-50%, -50%);
-    }
-
-    .arrow.left {
-      left: calc(var(--center) + var(--chevron-offset));
-      top: var(--center);
-      transform: translate(-50%, -50%) rotate(180deg);
-    }
-
-    .arrow.up {
-      left: var(--center);
-      top: calc(var(--center) + var(--chevron-offset));
-      transform: translate(-50%, -50%) rotate(270deg);
-    }
-
-    .arrow.down {
-      left: var(--center);
-      top: calc(var(--center) - var(--chevron-offset));
-      transform: translate(-50%, -50%) rotate(90deg);
-    }
-
-    .marker {
+    .marker.start {
       width: calc(var(--led) + 1mm);
       height: calc(var(--led) + 1mm);
       position: absolute;
-      left: calc(var(--pad) + var(--led) / 2);
-      top: calc(var(--pad) + var(--led) / 2);
+      left: var(--start-marker-x);
+      top: var(--led-y);
       transform: translate(-50%, -50%);
       background: var(--arrow);
       border-radius: 0.2mm;
       z-index: 1;
+    }
+
+    .marker.end {
+      width: calc(var(--led) + 2mm);
+      height: calc(var(--led) + 2mm);
+      position: absolute;
+      left: var(--end-marker-x);
+      top: var(--led-y);
+      transform: translate(-50%, -50%);
+      z-index: 1;
+      fill: var(--arrow);
     }
 
     button,
@@ -229,23 +206,14 @@
   <main>
     <section class="stage" aria-label="virtual optical target">
       <div class="device" aria-label="5-bit LED grid">
-        <i class="marker" aria-hidden="true"></i>
-        <i class="led" data-bit="4" data-on="1" style="--col: 0; --row: 0"></i>
-        <i class="led" data-bit="3" data-on="0" style="--col: 2; --row: 0"></i>
-        <i class="led" data-bit="2" data-on="1" style="--col: 1; --row: 1"></i>
-        <i class="led" data-bit="1" data-on="0" style="--col: 0; --row: 2"></i>
-        <i class="led" data-bit="0" data-on="1" style="--col: 2; --row: 2"></i>
-        <svg class="arrow down" viewBox="0 0 12 12" aria-hidden="true">
-          <polyline points="4 3 8 6 4 9"></polyline>
-        </svg>
-        <svg class="arrow right" viewBox="0 0 12 12" aria-hidden="true">
-          <polyline points="4 3 8 6 4 9"></polyline>
-        </svg>
-        <svg class="arrow left" viewBox="0 0 12 12" aria-hidden="true">
-          <polyline points="4 3 8 6 4 9"></polyline>
-        </svg>
-        <svg class="arrow up" viewBox="0 0 12 12" aria-hidden="true">
-          <polyline points="4 3 8 6 4 9"></polyline>
+        <i class="marker start" aria-hidden="true"></i>
+        <i class="led" data-bit="4" data-on="1" style="--index: 0"></i>
+        <i class="led" data-bit="3" data-on="0" style="--index: 1"></i>
+        <i class="led" data-bit="2" data-on="1" style="--index: 2"></i>
+        <i class="led" data-bit="1" data-on="0" style="--index: 3"></i>
+        <i class="led" data-bit="0" data-on="1" style="--index: 4"></i>
+        <svg class="marker end" viewBox="0 0 12 12" aria-hidden="true">
+          <polygon points="6 2 10 10 2 10"></polygon>
         </svg>
       </div>
     </section>
