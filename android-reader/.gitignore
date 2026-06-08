@@ -1,0 +1,36 @@
+# Android / Gradle
+.gradle/
+build/
+**/build/
+local.properties
+
+# Android Studio / IntelliJ
+.idea/
+*.iml
+*.iws
+*.ipr
+
+# Generated packages
+*.apk
+*.aab
+*.ap_
+*.dex
+
+# Kotlin / Java build noise
+*.class
+out/
+
+# Native / Android generated intermediates
+.cxx/
+captures/
+externalNativeBuild/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs and temp files
+*.log
+*.tmp
+*.temp
