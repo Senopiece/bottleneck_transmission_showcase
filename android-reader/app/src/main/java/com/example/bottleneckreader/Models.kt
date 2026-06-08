@@ -11,12 +11,17 @@ data class LedSlot(
     val imagePoint: ImagePoint,
     val bitIndex: Int,
     val isFirst: Boolean,
+    val imageRadius: Float,
 )
 
 data class DetectionFrame(
     val timestampNs: Long,
     val imageWidth: Int,
     val imageHeight: Int,
+    val cropLeft: Int,
+    val cropTop: Int,
+    val cropWidth: Int,
+    val cropHeight: Int,
     val rotationDegrees: Int,
     val bits: String?,
     val slots: List<LedSlot>,
@@ -30,6 +35,7 @@ data class OverlayFrame(
 data class OverlaySlot(
     val point: Offset,
     val isFirst: Boolean,
+    val radiusPx: Float,
 )
 
 data class ReaderNotice(

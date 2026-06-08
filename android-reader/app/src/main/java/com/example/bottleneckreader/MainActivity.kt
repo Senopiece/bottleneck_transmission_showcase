@@ -232,16 +232,17 @@ private fun DetectionOverlay(
         val current = frame ?: return@Canvas
         val overlay = current.toOverlay(size)
         overlay.slots.forEach { slot ->
+            val radius = slot.radiusPx.coerceIn(5.dp.toPx(), 14.dp.toPx())
             drawCircle(
                 color = Color.Yellow,
-                radius = 13.dp.toPx(),
+                radius = radius,
                 center = slot.point,
                 style = Stroke(width = 2.dp.toPx()),
             )
             if (slot.isFirst) {
                 drawCircle(
                     color = Color.Yellow,
-                    radius = 4.dp.toPx(),
+                    radius = (radius * 0.28f).coerceAtLeast(3.dp.toPx()),
                     center = slot.point,
                 )
             }
@@ -311,64 +312,100 @@ private fun NoticeQueue(
 }
 
 private fun DetectionFrame.toOverlay(canvasSize: Size): OverlayFrame {
+    val transform = imageToPreviewTransform(
+        cropLeft = cropLeft,
+        cropTop = cropTop,
+        cropWidth = cropWidth,
+        cropHeight = cropHeight,
+        rotationDegrees = rotationDegrees,
+        canvasSize = canvasSize,
+    )
     return OverlayFrame(
         bits = bits,
         slots = slots.map { slot ->
             OverlaySlot(
-                point = mapImageToPreview(
+                point = transform.map(
                     point = slot.imagePoint,
-                    imageWidth = imageWidth,
-                    imageHeight = imageHeight,
-                    rotationDegrees = rotationDegrees,
-                    canvasSize = canvasSize,
                 ),
                 isFirst = slot.isFirst,
+                radiusPx = slot.imageRadius * transform.scale,
             )
         },
     )
 }
 
-private fun mapImageToPreview(
-    point: ImagePoint,
-    imageWidth: Int,
-    imageHeight: Int,
+private fun imageToPreviewTransform(
+    cropLeft: Int,
+    cropTop: Int,
+    cropWidth: Int,
+    cropHeight: Int,
     rotationDegrees: Int,
     canvasSize: Size,
-): Offset {
-    val rotated = when (rotationDegrees) {
+): ImageToPreviewTransform {
+    val rotatedSize = when (rotationDegrees) {
+        90, 270 -> Size(cropHeight.toFloat(), cropWidth.toFloat())
+        else -> Size(cropWidth.toFloat(), cropHeight.toFloat())
+    }
+    val scale = maxOf(canvasSize.width / rotatedSize.width, canvasSize.height / rotatedSize.height)
+    val dx = (canvasSize.width - rotatedSize.width * scale) / 2f
+    val dy = (canvasSize.height - rotatedSize.height * scale) / 2f
+    return ImageToPreviewTransform(
+        cropLeft = cropLeft,
+        cropTop = cropTop,
+        cropWidth = cropWidth,
+        cropHeight = cropHeight,
+        rotationDegrees = rotationDegrees,
+        scale = scale,
+        dx = dx,
+        dy = dy,
+    )
+}
+
+private data class ImageToPreviewTransform(
+    val cropLeft: Int,
+    val cropTop: Int,
+    val cropWidth: Int,
+    val cropHeight: Int,
+    val rotationDegrees: Int,
+    val scale: Float,
+    val dx: Float,
+    val dy: Float,
+) {
+    fun map(point: ImagePoint): Offset {
+        val xInCrop = point.x - cropLeft
+        val yInCrop = point.y - cropTop
+        val rotated = when (rotationDegrees) {
         90 -> RotatedPoint(
-            x = imageHeight - point.y,
-            y = point.x,
-            width = imageHeight.toFloat(),
-            height = imageWidth.toFloat(),
+            x = cropHeight - yInCrop,
+            y = xInCrop,
+            width = cropHeight.toFloat(),
+            height = cropWidth.toFloat(),
         )
         180 -> RotatedPoint(
-            x = imageWidth - point.x,
-            y = imageHeight - point.y,
-            width = imageWidth.toFloat(),
-            height = imageHeight.toFloat(),
+            x = cropWidth - xInCrop,
+            y = cropHeight - yInCrop,
+            width = cropWidth.toFloat(),
+            height = cropHeight.toFloat(),
         )
         270 -> RotatedPoint(
-            x = point.y,
-            y = imageWidth - point.x,
-            width = imageHeight.toFloat(),
-            height = imageWidth.toFloat(),
+            x = yInCrop,
+            y = cropWidth - xInCrop,
+            width = cropHeight.toFloat(),
+            height = cropWidth.toFloat(),
         )
         else -> RotatedPoint(
-            x = point.x,
-            y = point.y,
-            width = imageWidth.toFloat(),
-            height = imageHeight.toFloat(),
+            x = xInCrop,
+            y = yInCrop,
+            width = cropWidth.toFloat(),
+            height = cropHeight.toFloat(),
         )
     }
 
-    val scale = maxOf(canvasSize.width / rotated.width, canvasSize.height / rotated.height)
-    val dx = (canvasSize.width - rotated.width * scale) / 2f
-    val dy = (canvasSize.height - rotated.height * scale) / 2f
-    return Offset(
-        x = dx + rotated.x * scale,
-        y = dy + rotated.y * scale,
-    )
+        return Offset(
+            x = dx + rotated.x * scale,
+            y = dy + rotated.y * scale,
+        )
+    }
 }
 
 private data class RotatedPoint(

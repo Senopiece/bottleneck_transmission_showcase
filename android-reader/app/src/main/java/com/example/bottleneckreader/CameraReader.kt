@@ -10,6 +10,7 @@ import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
+import androidx.camera.core.UseCaseGroup
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
@@ -73,6 +74,12 @@ class CameraReader(
     @Suppress("DEPRECATION")
     private fun bind(cameraProvider: ProcessCameraProvider) {
         if (closed.get()) return
+        if (previewView.viewPort == null && (previewView.width == 0 || previewView.height == 0)) {
+            previewView.post {
+                bind(cameraProvider)
+            }
+            return
+        }
 
         val fpsRange = Range(30, 30)
         val previewBuilder = Preview.Builder()
@@ -104,12 +111,25 @@ class CameraReader(
         analysis.setAnalyzer(analyzerExecutor, nextAnalyzer)
 
         cameraProvider.unbindAll()
-        camera = cameraProvider.bindToLifecycle(
-            lifecycleOwner,
-            CameraSelector.DEFAULT_BACK_CAMERA,
-            preview,
-            analysis,
-        )
+        val viewPort = previewView.viewPort
+        camera = if (viewPort != null) {
+            cameraProvider.bindToLifecycle(
+                lifecycleOwner,
+                CameraSelector.DEFAULT_BACK_CAMERA,
+                UseCaseGroup.Builder()
+                    .addUseCase(preview)
+                    .addUseCase(analysis)
+                    .setViewPort(viewPort)
+                    .build(),
+            )
+        } else {
+            cameraProvider.bindToLifecycle(
+                lifecycleOwner,
+                CameraSelector.DEFAULT_BACK_CAMERA,
+                preview,
+                analysis,
+            )
+        }
         camera?.cameraInfo?.cameraState?.observe(lifecycleOwner) { state ->
             val error = state.error ?: return@observe
             eventSink(
@@ -129,7 +149,10 @@ class CameraReader(
         private val stopCamera: () -> Unit,
     ) : ImageAnalysis.Analyzer {
         private var stopped = false
-        private var slowFrames = 0
+        private var firstFrameAtNs = 0L
+        private var slowSinceNs = 0L
+        private var warned = false
+        private var averageMs = 0.0
 
         fun stop() {
             stopped = true
@@ -151,6 +174,10 @@ class CameraReader(
                                 timestampNs = image.imageInfo.timestamp,
                                 imageWidth = image.width,
                                 imageHeight = image.height,
+                                cropLeft = image.cropRect.left,
+                                cropTop = image.cropRect.top,
+                                cropWidth = image.cropRect.width(),
+                                cropHeight = image.cropRect.height(),
                                 rotationDegrees = image.imageInfo.rotationDegrees,
                                 bits = null,
                                 slots = emptyList(),
@@ -174,8 +201,39 @@ class CameraReader(
             }
 
             val elapsedMs = (System.nanoTime() - started) / 1_000_000
-            if (elapsedMs > FRAME_BUDGET_MS) slowFrames++ else slowFrames = 0
-            if (slowFrames >= MAX_SLOW_FRAMES) {
+            updateWatchdog(elapsedMs)
+        }
+
+        private fun updateWatchdog(elapsedMs: Long) {
+            val now = System.nanoTime()
+            if (firstFrameAtNs == 0L) firstFrameAtNs = now
+            averageMs = if (averageMs == 0.0) {
+                elapsedMs.toDouble()
+            } else {
+                averageMs * 0.88 + elapsedMs * 0.12
+            }
+
+            if (now - firstFrameAtNs < STARTUP_GRACE_NS) {
+                return
+            }
+
+            val overloaded = averageMs > TERMINATE_AVERAGE_MS || elapsedMs > TERMINATE_SINGLE_FRAME_MS
+            if (overloaded) {
+                if (slowSinceNs == 0L) slowSinceNs = now
+                if (!warned && now - slowSinceNs > WARNING_AFTER_NS) {
+                    warned = true
+                    eventSink(
+                        ReaderEvent.Notice(
+                            "Decoder is slow: avg ${averageMs.toInt()} ms/frame",
+                        ),
+                    )
+                }
+            } else {
+                slowSinceNs = 0L
+                warned = false
+            }
+
+            if (slowSinceNs != 0L && now - slowSinceNs > TERMINATE_AFTER_NS) {
                 stopped = true
                 eventSink(ReaderEvent.SlowDecoderTerminated)
                 stopCamera()
@@ -183,8 +241,11 @@ class CameraReader(
         }
 
         private companion object {
-            const val FRAME_BUDGET_MS = 33L
-            const val MAX_SLOW_FRAMES = 8
+            const val TERMINATE_AVERAGE_MS = 55.0
+            const val TERMINATE_SINGLE_FRAME_MS = 160L
+            const val STARTUP_GRACE_NS = 3_000_000_000L
+            const val WARNING_AFTER_NS = 1_500_000_000L
+            const val TERMINATE_AFTER_NS = 4_500_000_000L
         }
     }
 }
