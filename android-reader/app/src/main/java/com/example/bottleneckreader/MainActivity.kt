@@ -231,7 +231,7 @@ private fun DetectionOverlay(
 ) {
     Canvas(modifier) {
         val roiWidth = size.width * ReaderRoi.WIDTH_FRACTION
-        val roiHeight = size.height * ReaderRoi.HEIGHT_FRACTION
+        val roiHeight = (roiWidth * ReaderRoi.ROI_ASPECT_RATIO).coerceAtMost(size.height)
         val roiTopLeft = Offset(
             x = (size.width - roiWidth) * 0.5f,
             y = (size.height - roiHeight) * 0.5f,
