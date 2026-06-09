@@ -6,6 +6,7 @@ import kotlin.math.abs
 import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.roundToInt
 
 class LedFrameDecoder {
     private data class Component(
@@ -32,54 +33,29 @@ class LedFrameDecoder {
         val slotStepPx: Float,
     )
 
-    private data class SlotLayout(
-        val slots: List<ImagePoint>,
-        val stepPx: Float,
-        val ledHits: Int,
-    )
-
-    private data class AxisHit(
-        val index: Int,
-        val fraction: Float,
-        val score: Float,
+    private data class RotatedRoi(
+        val left: Float,
+        val top: Float,
+        val width: Float,
+        val height: Float,
     )
 
     private val constants = GeometryConstants()
-    private var previousGeometry: Geometry? = null
-    private var frameIndex = 0
 
     private var mask = BooleanArray(0)
     private var seen = BooleanArray(0)
     private var queue = IntArray(0)
+    private var sampleXs = IntArray(0)
+    private var sampleYs = IntArray(0)
 
     fun decode(image: ImageProxy): DetectionFrame? {
         val reader = YuvReader(image)
-        frameIndex++
-
-        val fast = previousGeometry?.let { geometry ->
-            if (frameIndex % TRACK_RESCAN_PERIOD != 0 && markersStillVisible(reader, geometry)) {
-                decodeWithGeometry(reader, geometry)
-            } else {
-                null
-            }
-        }
-        if (fast != null) return fast
-
-        if (previousGeometry == null && frameIndex % LOST_TRACK_SCAN_PERIOD != 0) {
-            return null
-        }
-
-        val geometry = findGeometry(reader) ?: run {
-            previousGeometry = null
-            return null
-        }
-        previousGeometry = geometry
+        val geometry = findGeometry(reader) ?: return null
         return decodeWithGeometry(reader, geometry)
     }
 
     fun resetTracking() {
-        previousGeometry = null
-        frameIndex = 0
+        // The detector is intentionally stateless. Every frame is a full ROI rescan.
     }
 
     private fun decodeWithGeometry(reader: YuvReader, geometry: Geometry): DetectionFrame {
@@ -121,26 +97,15 @@ class LedFrameDecoder {
         )
     }
 
-    private fun markersStillVisible(reader: YuvReader, geometry: Geometry): Boolean {
-        val startGray = grayScore(reader, geometry.start, radiusPx = 5)
-        val endGray = grayScore(reader, geometry.end, radiusPx = 6)
-        return startGray > 24f && endGray > 20f &&
-            darkBackgroundScore(reader, geometry.start, geometry.end) > 0.62f &&
-            brightIntrusionsNearLine(reader, geometry.start, geometry.end) <= 2
-    }
-
     private fun findGeometry(reader: YuvReader): Geometry? {
-        return findGeometry(reader, stride = 4) ?: findGeometry(reader, stride = 2)
-    }
-
-    private fun findGeometry(reader: YuvReader, stride: Int): Geometry? {
-        val markers = whiteMarkerComponents(reader, stride)
+        val roi = reader.rotatedRoi()
+        val markers = grayMarkerComponents(reader, roi)
             .filter { it.isPlausibleMarker() }
             .sortedByDescending { it.area }
             .take(24)
         if (markers.size < 2) return null
 
-        val pair = bestMarkerPair(reader, markers) ?: return null
+        val pair = bestMarkerPair(reader, roi, markers) ?: return null
         val square = pair.start
         val triangle = pair.end
 
@@ -151,153 +116,101 @@ class LedFrameDecoder {
         val distance = hypot(dx, dy)
         if (distance < 32f) return null
 
-        val layout = fitSlotsOnAxis(reader, start, end)
-        val background = darkBackgroundScore(reader, start, end)
-        if (layout.ledHits < 2 && background < 0.93f) return null
+        val slots = fixedSlots(start, end)
+        if (!candidateInsideRoi(reader, roi, start, end, slots)) return null
 
         return Geometry(
             start = start,
             end = end,
-            slots = layout.slots,
-            slotStepPx = layout.stepPx,
+            slots = slots,
+            slotStepPx = distance * constants.slotStepFraction(),
         )
     }
 
-    private fun fitSlotsOnAxis(reader: YuvReader, start: ImagePoint, end: ImagePoint): SlotLayout {
+    private fun fixedSlots(start: ImagePoint, end: ImagePoint): List<ImagePoint> {
         val dx = end.x - start.x
         val dy = end.y - start.y
-        val distance = hypot(dx, dy)
-        if (distance < 1f) {
-            return SlotLayout(emptyList(), stepPx = 0f, ledHits = 0)
-        }
-
-        val baseFirst = constants.firstSlotFraction()
-        val baseStep = constants.slotStepFraction()
-        val hits = ArrayList<AxisHit>(5)
-        val searchSpan = baseStep * 0.42f
-        val searchSteps = 8
-        val sampleRadius = (distance * baseStep * 0.11f).toInt().coerceIn(2, 5)
-
-        for (index in 0 until 5) {
-            val expected = baseFirst + index * baseStep
-            var bestFraction = expected
-            var bestScore = Float.NEGATIVE_INFINITY
-            for (offset in -searchSteps..searchSteps) {
-                val fraction = expected + searchSpan * offset / searchSteps
-                val point = ImagePoint(start.x + dx * fraction, start.y + dy * fraction)
-                val score = ledSearchScore(reader, point, radiusPx = sampleRadius)
-                if (score > bestScore) {
-                    bestScore = score
-                    bestFraction = fraction
-                }
-            }
-            if (bestScore > 24f) {
-                hits.add(AxisHit(index = index, fraction = bestFraction, score = bestScore))
-            }
-        }
-
-        var step = baseStep
-        if (hits.size >= 2) {
-            var sum = 0f
-            var weight = 0f
-            for (i in 0 until hits.size - 1) {
-                for (j in i + 1 until hits.size) {
-                    val indexDelta = hits[j].index - hits[i].index
-                    if (indexDelta <= 0) continue
-                    val pairWeight = min(hits[i].score, hits[j].score).coerceAtLeast(1f)
-                    sum += ((hits[j].fraction - hits[i].fraction) / indexDelta) * pairWeight
-                    weight += pairWeight
-                }
-            }
-            if (weight > 0f) {
-                step = (sum / weight).coerceIn(baseStep * 0.84f, baseStep * 1.16f)
-            }
-        }
-
-        var first = baseFirst
-        if (hits.isNotEmpty()) {
-            var sum = 0f
-            var weight = 0f
-            hits.forEach { hit ->
-                val w = hit.score.coerceAtLeast(1f)
-                sum += (hit.fraction - hit.index * step) * w
-                weight += w
-            }
-            if (weight > 0f) {
-                first = (sum / weight).coerceIn(baseFirst - baseStep * 0.42f, baseFirst + baseStep * 0.42f)
-            }
-        }
-
-        val slots = List(5) { index ->
-            val fraction = first + index * step
+        return constants.slotFractions().map { fraction ->
             ImagePoint(start.x + dx * fraction, start.y + dy * fraction)
         }
-        val ledHits = slots.count { ledSearchScore(reader, it, radiusPx = sampleRadius) > 24f }
-        return SlotLayout(
-            slots = slots,
-            stepPx = distance * step,
-            ledHits = ledHits,
-        )
     }
 
-    private fun bestMarkerPair(reader: YuvReader, markers: List<Component>): MarkerPair? {
+    private fun bestMarkerPair(reader: YuvReader, roi: RotatedRoi, markers: List<Component>): MarkerPair? {
         var best: MarkerPair? = null
         for (start in markers) {
             if (!start.isSquareLike()) continue
             for (end in markers) {
                 if (start === end || !end.isTriangleLike()) continue
-                val pair = scoreMarkerPair(reader, start, end) ?: continue
+                val pair = scoreMarkerPair(reader, roi, start, end) ?: continue
                 if (best == null || pair.score > best.score) best = pair
             }
         }
-        return best?.takeIf { it.score >= 5.15f }
+        return best?.takeIf { it.score >= 3.55f }
     }
 
-    private fun scoreMarkerPair(reader: YuvReader, start: Component, end: Component): MarkerPair? {
+    private fun scoreMarkerPair(
+        reader: YuvReader,
+        roi: RotatedRoi,
+        start: Component,
+        end: Component,
+    ): MarkerPair? {
         val startAnchor = start.anchorPoint()
         val endAnchor = end.anchorPoint()
         val dx = endAnchor.x - startAnchor.x
         val dy = endAnchor.y - startAnchor.y
         val distance = hypot(dx, dy)
-        if (distance < 36f) return null
+        if (distance < 24f) return null
 
         val avgMarkerSize = (start.longSide() + end.longSide()) * 0.5f
         val distanceToMarkerRatio = distance / max(1f, avgMarkerSize)
-        if (distanceToMarkerRatio !in 6.8f..13.2f) return null
+        if (distanceToMarkerRatio !in 4.6f..18.5f) return null
 
         val sizeRatio = min(start.longSide(), end.longSide()) / max(start.longSide(), end.longSide())
-        if (sizeRatio < 0.58f) return null
+        if (sizeRatio < 0.36f) return null
+
+        val slots = fixedSlots(startAnchor, endAnchor)
+        if (!candidateInsideRoi(reader, roi, startAnchor, endAnchor, slots)) return null
 
         val backgroundScore = darkBackgroundScore(reader, startAnchor, endAnchor)
-        if (backgroundScore < 0.72f) return null
+        if (backgroundScore < 0.38f) return null
 
-        val layout = fitSlotsOnAxis(
-            reader = reader,
-            start = startAnchor,
-            end = endAnchor,
-        )
-        val ledHits = layout.ledHits
         val brightIntrusions = brightIntrusionsNearLine(reader, startAnchor, endAnchor)
-        if (brightIntrusions > 2) return null
-        if (ledHits < 2 && backgroundScore < 0.88f) return null
+        if (brightIntrusions > 4) return null
 
         val squareScore = start.squareScore()
         val startTriangleScore = start.triangleScore()
-        if (squareScore < startTriangleScore + 0.10f) return null
+        if (squareScore < startTriangleScore - 0.18f) return null
 
         val triangleScore = end.triangleScore()
         val endSquareScore = end.squareScore()
-        if (triangleScore < endSquareScore + 0.06f) return null
+        if (triangleScore < endSquareScore - 0.18f) return null
 
         val ratioScore = 1f - min(1f, abs(distanceToMarkerRatio - constants.markerDistanceToSizeRatio()) / 7f)
         val score = squareScore * 1.6f +
             triangleScore * 1.6f +
             backgroundScore * 1.4f +
             ratioScore +
-            ledHits * 0.45f -
             brightIntrusions * 0.55f
 
         return MarkerPair(start = start, end = end, score = score)
+    }
+
+    private fun candidateInsideRoi(
+        reader: YuvReader,
+        roi: RotatedRoi,
+        start: ImagePoint,
+        end: ImagePoint,
+        slots: List<ImagePoint>,
+    ): Boolean {
+        val points = slots + start + end
+        val margin = max(2f, hypot(end.x - start.x, end.y - start.y) * 0.035f)
+        return points.all { point ->
+            val rotated = reader.imageToRotated(point)
+            rotated.x >= roi.left + margin &&
+                rotated.x <= roi.left + roi.width - margin &&
+                rotated.y >= roi.top + margin &&
+                rotated.y <= roi.top + roi.height - margin
+        }
     }
 
     private fun brightIntrusionsNearLine(reader: YuvReader, start: ImagePoint, end: ImagePoint): Int {
@@ -358,18 +271,23 @@ class LedFrameDecoder {
         return if (total == 0) 0f else dark.toFloat() / total
     }
 
-    private fun whiteMarkerComponents(reader: YuvReader, stride: Int): List<Component> {
-        val smallW = reader.width / stride
-        val smallH = reader.height / stride
+    private fun grayMarkerComponents(reader: YuvReader, roi: RotatedRoi): List<Component> {
+        val smallW = ReaderRoi.GRID_COLUMNS
+        val smallH = ReaderRoi.GRID_ROWS
         val size = smallW * smallH
         ensureBuffers(size)
 
         var i = 0
         for (sy in 0 until smallH) {
-            val y = sy * stride
+            val ry = roi.top + (sy + 0.5f) * roi.height / smallH
             for (sx in 0 until smallW) {
-                val x = sx * stride
-                mask[i] = reader.isWhiteMarker(x, y)
+                val rx = roi.left + (sx + 0.5f) * roi.width / smallW
+                val p = reader.rotatedToImage(rx, ry)
+                val x = p.x.roundToInt()
+                val y = p.y.roundToInt()
+                sampleXs[i] = x
+                sampleYs[i] = y
+                mask[i] = reader.isGrayMarker(x, y)
                 seen[i] = false
                 i++
             }
@@ -378,7 +296,7 @@ class LedFrameDecoder {
         val components = ArrayList<Component>(8)
         for (idx in 0 until size) {
             if (!mask[idx] || seen[idx]) continue
-            val c = flood(mask, seen, queue, idx, smallW, smallH, stride)
+            val c = flood(mask, seen, queue, idx, smallW, smallH)
             if (c.area >= 4) components.add(c)
         }
         return components
@@ -407,35 +325,37 @@ class LedFrameDecoder {
     private fun Component.isPlausibleMarker(): Boolean {
         val w = widthPx()
         val h = heightPx()
-        if (w !in 4..96 || h !in 4..96) return false
-        if (area !in 3..900) return false
-        if (shortSide() / max(1f, longSide()) < 0.42f) return false
+        if (w !in 2..130 || h !in 2..130) return false
+        if (area !in 2..1200) return false
+        if (shortSide() / max(1f, longSide()) < 0.25f) return false
         return true
     }
 
     private fun Component.isSquareLike(): Boolean {
-        return fill > 0.66f && aspectScore() > 0.52f
+        return fill > 0.38f && aspectScore() > 0.30f
     }
 
     private fun Component.isTriangleLike(): Boolean {
-        return fill in 0.24f..0.66f && aspectScore() > 0.35f
+        return fill in 0.16f..0.86f && aspectScore() > 0.22f
     }
 
     private fun Component.squareScore(): Float {
-        val fillScore = ((fill - 0.64f) / 0.28f).coerceIn(0f, 1f)
-        return fillScore * 0.72f + aspectScore() * 0.28f
+        val fillScore = ((fill - 0.36f) / 0.48f).coerceIn(0f, 1f)
+        return fillScore * 0.58f + aspectScore() * 0.42f
     }
 
     private fun Component.triangleScore(): Float {
-        val fillScore = 1f - (abs(fill - 0.46f) / 0.24f).coerceIn(0f, 1f)
-        return fillScore * 0.76f + aspectScore() * 0.24f
+        val fillScore = 1f - (abs(fill - 0.45f) / 0.38f).coerceIn(0f, 1f)
+        return fillScore * 0.58f + aspectScore() * 0.42f
     }
 
     private fun ensureBuffers(size: Int) {
-        if (mask.size < size) {
+        if (mask.size < size || sampleXs.size < size || sampleYs.size < size) {
             mask = BooleanArray(size)
             seen = BooleanArray(size)
             queue = IntArray(size)
+            sampleXs = IntArray(size)
+            sampleYs = IntArray(size)
         }
     }
 
@@ -446,7 +366,6 @@ class LedFrameDecoder {
         start: Int,
         width: Int,
         height: Int,
-        stride: Int,
     ): Component {
         var head = 0
         var tail = 0
@@ -460,13 +379,17 @@ class LedFrameDecoder {
         var minY = Int.MAX_VALUE
         var maxX = Int.MIN_VALUE
         var maxY = Int.MIN_VALUE
+        var minGx = Int.MAX_VALUE
+        var minGy = Int.MAX_VALUE
+        var maxGx = Int.MIN_VALUE
+        var maxGy = Int.MIN_VALUE
 
         while (head < tail) {
             val idx = queue[head++]
             val sx = idx % width
             val sy = idx / width
-            val ix = sx * stride
-            val iy = sy * stride
+            val ix = sampleXs[idx]
+            val iy = sampleYs[idx]
             count++
             sumX += ix
             sumY += iy
@@ -474,6 +397,10 @@ class LedFrameDecoder {
             minY = min(minY, iy)
             maxX = max(maxX, ix)
             maxY = max(maxY, iy)
+            minGx = min(minGx, sx)
+            minGy = min(minGy, sy)
+            maxGx = max(maxGx, sx)
+            maxGy = max(maxGy, sy)
 
             if (sx > 0) {
                 val ni = idx - 1
@@ -505,7 +432,7 @@ class LedFrameDecoder {
             }
         }
 
-        val boxArea = max(1, ((maxX - minX) / stride + 1) * ((maxY - minY) / stride + 1))
+        val boxArea = max(1, (maxGx - minGx + 1) * (maxGy - minGy + 1))
         return Component(
             cx = sumX / count,
             cy = sumY / count,
@@ -605,6 +532,49 @@ class LedFrameDecoder {
         private val uPixelStride: Int = image.planes[1].pixelStride
         private val vPixelStride: Int = image.planes[2].pixelStride
 
+        fun rotatedRoi(): RotatedRoi {
+            val rotatedWidth = when (rotationDegrees) {
+                90, 270 -> cropHeight.toFloat()
+                else -> cropWidth.toFloat()
+            }
+            val rotatedHeight = when (rotationDegrees) {
+                90, 270 -> cropWidth.toFloat()
+                else -> cropHeight.toFloat()
+            }
+            val roiWidth = rotatedWidth * ReaderRoi.WIDTH_FRACTION
+            val roiHeight = rotatedHeight * ReaderRoi.HEIGHT_FRACTION
+            return RotatedRoi(
+                left = (rotatedWidth - roiWidth) * 0.5f,
+                top = (rotatedHeight - roiHeight) * 0.5f,
+                width = roiWidth,
+                height = roiHeight,
+            )
+        }
+
+        fun imageToRotated(point: ImagePoint): ImagePoint {
+            val x = point.x - cropLeft
+            val y = point.y - cropTop
+            return when (rotationDegrees) {
+                90 -> ImagePoint(cropHeight - y, x)
+                180 -> ImagePoint(cropWidth - x, cropHeight - y)
+                270 -> ImagePoint(y, cropWidth - x)
+                else -> ImagePoint(x, y)
+            }
+        }
+
+        fun rotatedToImage(x: Float, y: Float): ImagePoint {
+            val point = when (rotationDegrees) {
+                90 -> ImagePoint(y, cropHeight - x)
+                180 -> ImagePoint(cropWidth - x, cropHeight - y)
+                270 -> ImagePoint(cropWidth - y, x)
+                else -> ImagePoint(x, y)
+            }
+            return ImagePoint(
+                x = point.x + cropLeft,
+                y = point.y + cropTop,
+            )
+        }
+
         fun y(x: Int, y: Int): Int {
             return yBuffer.get(y * yRowStride + x).toInt() and 0xff
         }
@@ -622,10 +592,11 @@ class LedFrameDecoder {
             return (u(x, y) - v(x, y)) + (yy - 45) * 0.12f
         }
 
-        fun isWhiteMarker(x: Int, y: Int): Boolean {
+        fun isGrayMarker(x: Int, y: Int): Boolean {
+            if (x !in 0 until width || y !in 0 until height) return false
             val yy = this.y(x, y)
-            if (yy <= 150) return false
-            return abs(u(x, y) - 128) < 26 && abs(v(x, y) - 128) < 26
+            if (yy <= 115) return false
+            return abs(u(x, y) - 128) < 42 && abs(v(x, y) - 128) < 42
         }
     }
 

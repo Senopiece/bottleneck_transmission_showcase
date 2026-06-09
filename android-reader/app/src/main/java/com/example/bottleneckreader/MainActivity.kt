@@ -229,6 +229,19 @@ private fun DetectionOverlay(
     modifier: Modifier = Modifier,
 ) {
     Canvas(modifier) {
+        val roiWidth = size.width * ReaderRoi.WIDTH_FRACTION
+        val roiHeight = size.height * ReaderRoi.HEIGHT_FRACTION
+        val roiTopLeft = Offset(
+            x = (size.width - roiWidth) * 0.5f,
+            y = (size.height - roiHeight) * 0.5f,
+        )
+        drawRect(
+            color = Color(0xB0E8EAEE),
+            topLeft = roiTopLeft,
+            size = Size(roiWidth, roiHeight),
+            style = Stroke(width = 1.5.dp.toPx()),
+        )
+
         val current = frame ?: return@Canvas
         val overlay = current.toOverlay(size)
         overlay.slots.forEach { slot ->
