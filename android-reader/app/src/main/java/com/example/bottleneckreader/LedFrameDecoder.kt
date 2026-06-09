@@ -200,17 +200,21 @@ class LedFrameDecoder {
     private fun centerRoiFit(reader: YuvReader, roi: RotatedRoi): Fit? {
         var bestTheta: Theta? = null
         var bestScore = BAD_SCORE
-        val rx = roi.left + roi.width * 0.5f
-        val ry = roi.top + roi.height * 0.5f
-        for (angle in CENTER_ANGLES) {
-            for (distanceFraction in CENTER_DISTANCE_FRACTIONS) {
-                val markerDistance = roi.width * distanceFraction
-                val scale = markerDistance / constants.markerDistanceToSizeRatio()
-                val theta = thetaFromRotated(reader, rx, ry, angle, scale)
-                val score = scoreTheta(reader, roi, theta)
-                if (score > bestScore) {
-                    bestScore = score
-                    bestTheta = theta
+        for (offsetY in CENTER_Y_OFFSETS) {
+            val ry = roi.top + roi.height * (0.5f + offsetY)
+            for (offsetX in CENTER_X_OFFSETS) {
+                val rx = roi.left + roi.width * (0.5f + offsetX)
+                for (angle in CENTER_ANGLES) {
+                    for (distanceFraction in CENTER_DISTANCE_FRACTIONS) {
+                        val markerDistance = roi.width * distanceFraction
+                        val scale = markerDistance / constants.markerDistanceToSizeRatio()
+                        val theta = thetaFromRotated(reader, rx, ry, angle, scale)
+                        val score = scoreTheta(reader, roi, theta)
+                        if (score > bestScore) {
+                            bestScore = score
+                            bestTheta = theta
+                        }
+                    }
                 }
             }
         }
@@ -379,13 +383,21 @@ class LedFrameDecoder {
         var bestTheta = seed
         var bestScore = seedScore
         val move = max(0.8f, seed.scale * 0.08f)
-        val angle = 0.008f
-        val scale = 0.006f
+        val fineMove = max(0.45f, seed.scale * 0.035f)
+        val angle = 0.012f
+        val scale = 0.010f
+        val model = modelForTheta(seed)
         val candidates = arrayOf(
             seed.copy(cx = seed.cx - move),
             seed.copy(cx = seed.cx + move),
             seed.copy(cy = seed.cy - move),
             seed.copy(cy = seed.cy + move),
+            seed.copy(cx = seed.cx + model.ux * fineMove, cy = seed.cy + model.uy * fineMove),
+            seed.copy(cx = seed.cx - model.ux * fineMove, cy = seed.cy - model.uy * fineMove),
+            seed.copy(cx = seed.cx + model.vx * fineMove, cy = seed.cy + model.vy * fineMove),
+            seed.copy(cx = seed.cx - model.vx * fineMove, cy = seed.cy - model.vy * fineMove),
+            seed.copy(cx = seed.cx + model.vx * move, cy = seed.cy + model.vy * move),
+            seed.copy(cx = seed.cx - model.vx * move, cy = seed.cy - model.vy * move),
             seed.copy(angle = seed.angle - angle),
             seed.copy(angle = seed.angle + angle),
             seed.copy(scale = seed.scale * (1f - scale)),
@@ -1091,7 +1103,7 @@ class LedFrameDecoder {
         private val gapMm = 2.5f
         private val markerMm = 4f
         private val squareMm = ledMm + 0.45f
-        private val triangleMm = ledMm + 1.2f
+        private val triangleMm = ledMm + 2f
         private val markerGapMm = 4f
         private val stepMm = ledMm + gapMm
         private val markerDistanceMm = markerMm + markerGapMm * 2 + ledMm + stepMm * 4
@@ -1147,7 +1159,9 @@ class LedFrameDecoder {
             (-12f * PI / 180.0).toFloat(),
             (12f * PI / 180.0).toFloat(),
         )
-        val CENTER_DISTANCE_FRACTIONS = floatArrayOf(0.44f, 0.50f, 0.56f, 0.62f, 0.68f, 0.74f)
+        val CENTER_X_OFFSETS = floatArrayOf(-0.07f, 0f, 0.07f)
+        val CENTER_Y_OFFSETS = floatArrayOf(-0.20f, 0f, 0.20f)
+        val CENTER_DISTANCE_FRACTIONS = floatArrayOf(0.40f, 0.46f, 0.52f, 0.58f, 0.64f, 0.70f)
         val SAMPLE_X = floatArrayOf(0f, 1f, -1f, 0f, 0f, 0.70f, -0.70f, 0.70f, -0.70f, 0.45f, -0.45f, 0f, 0f)
         val SAMPLE_Y = floatArrayOf(0f, 0f, 0f, 1f, -1f, 0.70f, 0.70f, -0.70f, -0.70f, 0f, 0f, 0.45f, -0.45f)
         val SAMPLE_W = floatArrayOf(0.24f, 0.09f, 0.09f, 0.09f, 0.09f, 0.06f, 0.06f, 0.06f, 0.06f, 0.04f, 0.04f, 0.04f, 0.04f)

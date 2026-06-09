@@ -299,7 +299,7 @@ private fun DetectionOverlay(
                     drawPath(path = path, color = Color(0xFFE8EAEE), style = markerStroke)
                 }
                 MarkerKind.EndTriangle -> {
-                    val half = marker.sizePx * 0.5f
+                    val half = marker.sizePx * 0.38f
                     val path = Path().apply {
                         val apex = marker.point.offsetBy(ux, uy, vx, vy, 0f, -half)
                         val right = marker.point.offsetBy(ux, uy, vx, vy, half * 0.92f, half)
