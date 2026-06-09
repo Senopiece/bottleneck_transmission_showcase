@@ -19,6 +19,7 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -139,12 +140,7 @@ private fun ReaderApp(viewModel: ReaderViewModel = viewModel()) {
             modifier = Modifier.fillMaxSize(),
         )
 
-        DecodedBadge(
-            value = frame?.bits ?: "null",
-            modifier = Modifier
-                .align(Alignment.BottomCenter)
-                .padding(bottom = 28.dp),
-        )
+        DecodedBadgeBelowRoi(value = frame?.bits ?: "null")
 
         NoticeQueue(
             notices = notices,
@@ -305,6 +301,21 @@ private fun DetectionOverlay(
                 )
             }
         }
+    }
+}
+
+@Composable
+private fun DecodedBadgeBelowRoi(value: String) {
+    BoxWithConstraints(Modifier.fillMaxSize()) {
+        val roiWidth = maxWidth * ReaderRoi.WIDTH_FRACTION
+        val roiHeight = (roiWidth * ReaderRoi.ROI_ASPECT_RATIO).coerceAtMost(maxHeight)
+        val topOffset = (maxHeight - roiHeight) / 2 + roiHeight + 10.dp
+        DecodedBadge(
+            value = value,
+            modifier = Modifier
+                .align(Alignment.TopCenter)
+                .padding(top = topOffset),
+        )
     }
 }
 

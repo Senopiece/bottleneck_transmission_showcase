@@ -58,6 +58,9 @@ class LedFrameDecoder {
     private var sampleYs = IntArray(0)
     private var lastGeometry: Geometry? = null
     private var missedFrames = 0
+    private var pendingBits: String? = null
+    private var pendingBitFrames = 0
+    private var stableBits: String? = null
 
     fun decode(image: ImageProxy): DetectionFrame? {
         val reader = YuvReader(image)
@@ -78,32 +81,46 @@ class LedFrameDecoder {
                 }
             }
             else -> null
-        } ?: return null
+        } ?: run {
+            resetBitDebounce()
+            return null
+        }
         return decodeWithGeometry(reader, geometry)
     }
 
     fun resetTracking() {
         lastGeometry = null
         missedFrames = 0
+        resetBitDebounce()
     }
 
     private fun decodeWithGeometry(reader: YuvReader, geometry: Geometry): DetectionFrame {
-        val sampleRadius = (geometry.slotStepPx * 0.12f).toInt().coerceIn(2, 5)
-        val lumaScores = geometry.slots.map { slot -> lumaScore(reader, slot, radiusPx = sampleRadius) }
-        val blueScores = geometry.slots.map { slot -> blueScore(reader, slot, radiusPx = sampleRadius) }
-        val minLuma = lumaScores.minOrNull() ?: 0f
-        val maxLuma = lumaScores.maxOrNull() ?: 0f
-        val lumaThreshold = if (maxLuma - minLuma > 30f) {
-            minLuma + (maxLuma - minLuma) * 0.54f
-        } else {
-            135f
+        val sampleRadius = (geometry.slotStepPx * 0.15f).toInt().coerceIn(2, 7)
+        val bitScores = geometry.slots.map { slot ->
+            ledBitScore(
+                reader = reader,
+                slot = slot,
+                start = geometry.start,
+                end = geometry.end,
+                slotStepPx = geometry.slotStepPx,
+                radiusPx = sampleRadius,
+            )
         }
-        val bits = buildString(capacity = 5) {
+        val minBit = bitScores.minOrNull() ?: 0f
+        val maxBit = bitScores.maxOrNull() ?: 0f
+        val bitThreshold = if (maxBit - minBit > 18f) {
+            max(22f, minBit + (maxBit - minBit) * 0.42f)
+        } else {
+            22f
+        }
+        val lowConfidence = bitScores.any { abs(it - bitThreshold) < 4.5f }
+        val rawBits = buildString(capacity = 5) {
             geometry.slots.indices.forEach { index ->
-                val isOn = lumaScores[index] > lumaThreshold && blueScores[index] > 12f
+                val isOn = bitScores[index] > bitThreshold
                 append(if (isOn) '1' else '0')
             }
         }
+        val bits = if (lowConfidence) stableBits ?: rawBits else stabilizeBits(rawBits)
         val overlayRadius = (geometry.slotStepPx * 0.20f).coerceIn(4f, 12f)
         return DetectionFrame(
             timestampNs = reader.timestampNs,
@@ -141,6 +158,43 @@ class LedFrameDecoder {
                 ),
             ),
         )
+    }
+
+    private fun stabilizeBits(rawBits: String): String {
+        val currentStable = stableBits
+        if (currentStable == null) {
+            stableBits = rawBits
+            pendingBits = null
+            pendingBitFrames = 0
+            return rawBits
+        }
+        if (rawBits == currentStable) {
+            pendingBits = null
+            pendingBitFrames = 0
+            return currentStable
+        }
+
+        if (rawBits == pendingBits) {
+            pendingBitFrames++
+        } else {
+            pendingBits = rawBits
+            pendingBitFrames = 1
+        }
+
+        return if (pendingBitFrames >= BIT_CHANGE_CONFIRM_FRAMES) {
+            stableBits = rawBits
+            pendingBits = null
+            pendingBitFrames = 0
+            rawBits
+        } else {
+            currentStable
+        }
+    }
+
+    private fun resetBitDebounce() {
+        pendingBits = null
+        pendingBitFrames = 0
+        stableBits = null
     }
 
     private fun findGeometry(reader: YuvReader): Geometry? {
@@ -316,6 +370,14 @@ class LedFrameDecoder {
 
         val slots = fixedSlots(startAnchor, endAnchor)
         if (!candidateInsideRoi(reader, roi, startAnchor, endAnchor, slots)) return null
+        val slotStructureScore = ledSlotStructureScore(
+            reader = reader,
+            start = startAnchor,
+            end = endAnchor,
+            slots = slots,
+            slotStepPx = distance * constants.slotStepFraction(),
+        )
+        if (slotStructureScore < -0.08f) return null
 
         val backgroundScore = darkBackgroundScore(reader, startAnchor, endAnchor)
         if (backgroundScore < 0.16f) return null
@@ -336,6 +398,7 @@ class LedFrameDecoder {
             triangleScore * 1.6f +
             squareShapeScore * 1.1f +
             triangleShapeScore * 1.1f +
+            slotStructureScore * 1.55f +
             backgroundScore * 1.4f +
             ratioScore +
             markerQuietnessScore(reader, startAnchor, fittedStart.sizePx) +
@@ -546,6 +609,89 @@ class LedFrameDecoder {
         return (1f - (leak / 34f).coerceIn(0f, 1f)) * 0.85f
     }
 
+    private fun ledSlotStructureScore(
+        reader: YuvReader,
+        start: ImagePoint,
+        end: ImagePoint,
+        slots: List<ImagePoint>,
+        slotStepPx: Float,
+    ): Float {
+        val dx = end.x - start.x
+        val dy = end.y - start.y
+        val distance = hypot(dx, dy)
+        if (distance < 1f) return -1f
+        val ux = dx / distance
+        val uy = dy / distance
+        val vx = -uy
+        val vy = ux
+        val radius = (slotStepPx * 0.16f).toInt().coerceIn(2, 7)
+        val centerSignal = slots.map { ledPresenceScore(reader, it, radius) }.average().toFloat()
+
+        val betweenSignals = ArrayList<Float>(8)
+        for (index in 0 until slots.lastIndex) {
+            betweenSignals.add(
+                ledPresenceScore(
+                    reader = reader,
+                    center = ImagePoint(
+                        x = (slots[index].x + slots[index + 1].x) * 0.5f,
+                        y = (slots[index].y + slots[index + 1].y) * 0.5f,
+                    ),
+                    radiusPx = radius,
+                ),
+            )
+        }
+        val sideOffset = slotStepPx * 0.55f
+        for (slot in slots) {
+            betweenSignals.add(ledPresenceScore(reader, slot.offset(ux, uy, vx, vy, 0f, sideOffset), radius))
+            betweenSignals.add(ledPresenceScore(reader, slot.offset(ux, uy, vx, vy, 0f, -sideOffset), radius))
+        }
+        val backgroundSignal = betweenSignals.average().toFloat()
+        return ((centerSignal - backgroundSignal) / 42f).coerceIn(-1f, 1f)
+    }
+
+    private fun ledPresenceScore(reader: YuvReader, center: ImagePoint, radiusPx: Int): Float {
+        val luma = lumaScore(reader, center, radiusPx)
+        val blue = blueScore(reader, center, radiusPx)
+        return max(0f, blue) * 0.74f + max(0f, luma - 88f) * 0.26f
+    }
+
+    private fun ledBitScore(
+        reader: YuvReader,
+        slot: ImagePoint,
+        start: ImagePoint,
+        end: ImagePoint,
+        slotStepPx: Float,
+        radiusPx: Int,
+    ): Float {
+        val dx = end.x - start.x
+        val dy = end.y - start.y
+        val distance = hypot(dx, dy)
+        if (distance < 1f) return 0f
+        val ux = dx / distance
+        val uy = dy / distance
+        val vx = -uy
+        val vy = ux
+        val sideOffset = slotStepPx * 0.82f
+        val sideRadius = (radiusPx * 1.15f).roundToInt().coerceAtLeast(radiusPx)
+        val lumaBackground = arrayOf(
+            lumaScore(reader, slot.offset(ux, uy, vx, vy, 0f, sideOffset), sideRadius),
+            lumaScore(reader, slot.offset(ux, uy, vx, vy, 0f, -sideOffset), sideRadius),
+            lumaScore(reader, slot.offset(ux, uy, vx, vy, slotStepPx * 0.28f, sideOffset), sideRadius),
+            lumaScore(reader, slot.offset(ux, uy, vx, vy, -slotStepPx * 0.28f, sideOffset), sideRadius),
+            lumaScore(reader, slot.offset(ux, uy, vx, vy, slotStepPx * 0.28f, -sideOffset), sideRadius),
+            lumaScore(reader, slot.offset(ux, uy, vx, vy, -slotStepPx * 0.28f, -sideOffset), sideRadius),
+        ).average().toFloat()
+        val blueBackground = arrayOf(
+            blueScore(reader, slot.offset(ux, uy, vx, vy, 0f, sideOffset), sideRadius),
+            blueScore(reader, slot.offset(ux, uy, vx, vy, 0f, -sideOffset), sideRadius),
+        )
+            .average()
+            .toFloat()
+        val lumaContrast = lumaScore(reader, slot, radiusPx) - lumaBackground
+        val blueContrast = blueScore(reader, slot, radiusPx) - blueBackground
+        return lumaContrast + max(0f, blueContrast) * 0.10f
+    }
+
     private fun squareDeviceShapeScore(
         reader: YuvReader,
         center: ImagePoint,
@@ -555,7 +701,7 @@ class LedFrameDecoder {
         vx: Float,
         vy: Float,
     ): Float {
-        val half = markerSizePx * 0.34f
+        val half = markerSizePx * 0.42f
         val radius = (markerSizePx * 0.10f).toInt().coerceIn(1, 5)
         val cornerPoints = arrayOf(
             center.offset(ux, uy, vx, vy, -half, -half),
@@ -1091,6 +1237,7 @@ class LedFrameDecoder {
     }
 
     private companion object {
+        const val BIT_CHANGE_CONFIRM_FRAMES = 3
         const val MAX_GEOMETRY_HOLD_FRAMES = 8
         const val LOST_TRACK_SCAN_PERIOD = 3
         const val TRACK_RESCAN_PERIOD = 12
