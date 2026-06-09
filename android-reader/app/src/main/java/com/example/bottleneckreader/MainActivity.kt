@@ -45,6 +45,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
@@ -244,6 +245,50 @@ private fun DetectionOverlay(
 
         val current = frame ?: return@Canvas
         val overlay = current.toOverlay(size)
+        overlay.markers.forEach { marker ->
+            val markerStroke = Stroke(width = 1.5.dp.toPx())
+            val ax = marker.alongPoint.x - marker.point.x
+            val ay = marker.alongPoint.y - marker.point.y
+            val length = kotlin.math.hypot(ax, ay).coerceAtLeast(1f)
+            val ux = ax / length
+            val uy = ay / length
+            val vx = -uy
+            val vy = ux
+            when (marker.kind) {
+                MarkerKind.StartSquare -> {
+                    val half = marker.sizePx * 0.5f
+                    val path = Path().apply {
+                        val p0 = marker.point.offsetBy(ux, uy, vx, vy, -half, -half)
+                        val p1 = marker.point.offsetBy(ux, uy, vx, vy, half, -half)
+                        val p2 = marker.point.offsetBy(ux, uy, vx, vy, half, half)
+                        val p3 = marker.point.offsetBy(ux, uy, vx, vy, -half, half)
+                        moveTo(p0.x, p0.y)
+                        lineTo(p1.x, p1.y)
+                        lineTo(p2.x, p2.y)
+                        lineTo(p3.x, p3.y)
+                        close()
+                    }
+                    drawPath(path = path, color = Color(0xFFE8EAEE), style = markerStroke)
+                }
+                MarkerKind.EndTriangle -> {
+                    val half = marker.sizePx * 0.5f
+                    val path = Path().apply {
+                        val apex = marker.point.offsetBy(ux, uy, vx, vy, 0f, -half)
+                        val right = marker.point.offsetBy(ux, uy, vx, vy, half * 0.92f, half)
+                        val left = marker.point.offsetBy(ux, uy, vx, vy, -half * 0.92f, half)
+                        moveTo(apex.x, apex.y)
+                        lineTo(right.x, right.y)
+                        lineTo(left.x, left.y)
+                        close()
+                    }
+                    drawPath(
+                        path = path,
+                        color = Color(0xFFE8EAEE),
+                        style = markerStroke,
+                    )
+                }
+            }
+        }
         overlay.slots.forEach { slot ->
             val radius = slot.radiusPx.coerceIn(5.dp.toPx(), 14.dp.toPx())
             drawCircle(
@@ -344,6 +389,28 @@ private fun DetectionFrame.toOverlay(canvasSize: Size): OverlayFrame {
                 radiusPx = slot.imageRadius * transform.scale,
             )
         },
+        markers = markers.map { marker ->
+            OverlayMarker(
+                point = transform.map(marker.imagePoint),
+                alongPoint = transform.map(marker.imageAlongPoint),
+                kind = marker.kind,
+                sizePx = marker.imageSize * transform.scale,
+            )
+        },
+    )
+}
+
+private fun Offset.offsetBy(
+    ux: Float,
+    uy: Float,
+    vx: Float,
+    vy: Float,
+    along: Float,
+    normal: Float,
+): Offset {
+    return Offset(
+        x = x + ux * along + vx * normal,
+        y = y + uy * along + vy * normal,
     )
 }
 

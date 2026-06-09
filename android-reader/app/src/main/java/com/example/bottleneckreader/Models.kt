@@ -14,6 +14,18 @@ data class LedSlot(
     val imageRadius: Float,
 )
 
+enum class MarkerKind {
+    StartSquare,
+    EndTriangle,
+}
+
+data class MarkerSlot(
+    val imagePoint: ImagePoint,
+    val imageAlongPoint: ImagePoint,
+    val kind: MarkerKind,
+    val imageSize: Float,
+)
+
 data class DetectionFrame(
     val timestampNs: Long,
     val imageWidth: Int,
@@ -25,17 +37,26 @@ data class DetectionFrame(
     val rotationDegrees: Int,
     val bits: String?,
     val slots: List<LedSlot>,
+    val markers: List<MarkerSlot> = emptyList(),
 )
 
 data class OverlayFrame(
     val bits: String?,
     val slots: List<OverlaySlot>,
+    val markers: List<OverlayMarker>,
 )
 
 data class OverlaySlot(
     val point: Offset,
     val isFirst: Boolean,
     val radiusPx: Float,
+)
+
+data class OverlayMarker(
+    val point: Offset,
+    val alongPoint: Offset,
+    val kind: MarkerKind,
+    val sizePx: Float,
 )
 
 data class ReaderNotice(
