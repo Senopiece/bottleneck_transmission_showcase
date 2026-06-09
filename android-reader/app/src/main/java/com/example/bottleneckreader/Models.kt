@@ -38,6 +38,7 @@ data class DetectionFrame(
     val bits: String?,
     val slots: List<LedSlot>,
     val markers: List<MarkerSlot> = emptyList(),
+    val debugLines: List<String> = emptyList(),
 )
 
 data class OverlayFrame(

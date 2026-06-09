@@ -181,6 +181,7 @@ class CameraReader(
                                 rotationDegrees = image.imageInfo.rotationDegrees,
                                 bits = null,
                                 slots = emptyList(),
+                                debugLines = decoder.lastDebugLines,
                             ),
                         ),
                     )
@@ -241,11 +242,11 @@ class CameraReader(
         }
 
         private companion object {
-            const val TERMINATE_AVERAGE_MS = 55.0
-            const val TERMINATE_SINGLE_FRAME_MS = 160L
+            const val TERMINATE_AVERAGE_MS = 85.0
+            const val TERMINATE_SINGLE_FRAME_MS = 240L
             const val STARTUP_GRACE_NS = 3_000_000_000L
-            const val WARNING_AFTER_NS = 1_500_000_000L
-            const val TERMINATE_AFTER_NS = 4_500_000_000L
+            const val WARNING_AFTER_NS = 2_500_000_000L
+            const val TERMINATE_AFTER_NS = 8_000_000_000L
         }
     }
 }

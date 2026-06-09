@@ -142,6 +142,13 @@ private fun ReaderApp(viewModel: ReaderViewModel = viewModel()) {
 
         DecodedBadgeBelowRoi(value = frame?.bits ?: "null")
 
+        DebugPanel(
+            lines = frame?.debugLines.orEmpty(),
+            modifier = Modifier
+                .align(Alignment.TopStart)
+                .padding(top = 18.dp, start = 12.dp),
+        )
+
         NoticeQueue(
             notices = notices,
             modifier = Modifier
@@ -183,6 +190,31 @@ private fun ReaderApp(viewModel: ReaderViewModel = viewModel()) {
                 }
             },
         )
+    }
+}
+
+@Composable
+private fun DebugPanel(
+    lines: List<String>,
+    modifier: Modifier = Modifier,
+) {
+    if (lines.isEmpty()) return
+    Column(
+        modifier = modifier
+            .widthIn(max = 340.dp)
+            .background(Color(0xB8000000), RoundedCornerShape(6.dp))
+            .padding(horizontal = 10.dp, vertical = 8.dp),
+        verticalArrangement = Arrangement.spacedBy(2.dp),
+    ) {
+        lines.take(10).forEach { line ->
+            Text(
+                text = line,
+                color = Color(0xFFE8EAEE),
+                fontSize = 11.sp,
+                lineHeight = 13.sp,
+                fontWeight = FontWeight.Medium,
+            )
+        }
     }
 }
 
