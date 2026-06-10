@@ -36,8 +36,8 @@ The accepted `Fit` keeps the final score breakdown, so acceptance does not resam
 
 The score is a weighted sum:
 
-- square marker template match;
-- triangle marker template match;
+- square marker template match
+- triangle marker template match
 
 Square and triangle templates are evaluated in normalized marker coordinates. They use positive interior samples and negative outside samples. The square template requires filled corners; the triangle template requires a filled taper and base with empty upper side regions.
 
@@ -47,8 +47,8 @@ The score is intentionally geometric and local. It does not run Canny/Sobel cont
 
 A pattern is emitted only when:
 
-- final score is above `MIN_ACCEPT_SCORE`;
-- square and triangle component scores pass individual minimum gates;
+- final score is above `MIN_ACCEPT_SCORE`
+- square and triangle component scores pass individual minimum gates
 
 Otherwise `null` is emitted and tracking is reset after repeated misses.
 
