@@ -23,12 +23,14 @@ The current implementation uses a fixed small coordinate-ascent schedule, not a 
 3. Move to the best candidate if it improves the score.
 4. Repeat for a fixed decreasing step schedule.
 
-There is no convergence-based early stop. This keeps frame cost predictable.
+If a step level does not improve a pose that already passes the acceptance gates, refinement stops early. This avoids spending fine-grained steps when the seed was already good.
 
 There are two schedules:
 
 - acquire: wider steps from the ideal ROI-centered pose;
 - tracking: smaller steps from the previous accepted pose, so the tracker does not drift aggressively onto nearby UI/text.
+
+The accepted `Fit` keeps the final score breakdown, so acceptance does not resample the same pose a second time.
 
 ## Score
 

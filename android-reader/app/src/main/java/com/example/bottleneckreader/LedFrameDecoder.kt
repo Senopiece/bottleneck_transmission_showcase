@@ -35,7 +35,7 @@ class LedFrameDecoder {
     private data class PatternModel(
         val start: ImagePoint,
         val end: ImagePoint,
-        val slots: List<ImagePoint>,
+        val slots: Array<ImagePoint>,
         val markerSizePx: Float,
         val squareSizePx: Float,
         val triangleSizePx: Float,
@@ -49,9 +49,11 @@ class LedFrameDecoder {
 
     private data class Fit(
         val theta: Theta,
-        val score: Float,
+        val breakdown: ScoreBreakdown,
         val confidence: Float,
-    )
+    ) {
+        val score: Float get() = breakdown.score
+    }
 
     private data class LedBitMeasurement(
         val isOn: Boolean,
@@ -88,9 +90,14 @@ class LedFrameDecoder {
     private var previousConfidence = 0f
     private var missedFrames = 0
     private var debugModeLine = "mode: none"
-    private var debugBestLine = "best: none"
     private var debugBitsLine = "bitScore: none"
     private var debugBestScore = BAD_SCORE
+    private var debugBestSquare = 0f
+    private var debugBestTriangle = 0f
+    private var debugBestLed = 0f
+    private var debugBestOffLine = 0f
+    private var debugBestBackground = 0f
+    private var debugBestDistanceInRoi = 0f
 
     fun decode(image: ImageProxy): DetectionFrame? {
         val reader = YuvReader(image)
@@ -106,11 +113,11 @@ class LedFrameDecoder {
         }
 
         var fit = refine(reader, roi, seed, if (tracking) TRACKING_STEPS else ACQUIRE_STEPS)
-        if (tracking && !isAccepted(reader, roi, fit)) {
+        if (tracking && !isAccepted(fit)) {
             debugModeLine = "mode: tracking fallback prevConf=${fmt(previousConfidence)} missed=$missedFrames"
             fit = refine(reader, roi, centeredTheta(reader, roi), ACQUIRE_STEPS)
         }
-        if (!isAccepted(reader, roi, fit)) {
+        if (!isAccepted(fit)) {
             missedFrames++
             if (missedFrames >= RESET_AFTER_MISSES) {
                 previousTheta = null
@@ -138,9 +145,14 @@ class LedFrameDecoder {
 
     private fun beginDebugFrame() {
         debugModeLine = "mode: none"
-        debugBestLine = "best: none"
         debugBitsLine = "bitScore: none"
         debugBestScore = BAD_SCORE
+        debugBestSquare = 0f
+        debugBestTriangle = 0f
+        debugBestLed = 0f
+        debugBestOffLine = 0f
+        debugBestBackground = 0f
+        debugBestDistanceInRoi = 0f
     }
 
     private fun finishDebugFrame(status: String, fit: Fit?, bits: String?): List<String> {
@@ -152,7 +164,7 @@ class LedFrameDecoder {
         } else {
             lines.add("fit: none prevConf=${fmt(previousConfidence)} missed=$missedFrames")
         }
-        lines.add(debugBestLine)
+        lines.add(debugBestLine())
         lines.add(debugBitsLine)
         lines.add("threshold score=$SCORE_THRESHOLD accept=$ACCEPT_CONFIDENCE")
         lastDebugLines = lines
@@ -160,6 +172,12 @@ class LedFrameDecoder {
     }
 
     private fun fmt(value: Float): String = String.format(Locale.US, "%.2f", value)
+
+    private fun debugBestLine(): String {
+        if (debugBestScore == BAD_SCORE) return "best: none"
+        return "best score=${fmt(debugBestScore)} sq=${fmt(debugBestSquare)} tri=${fmt(debugBestTriangle)} led=${fmt(debugBestLed)}" +
+            " off=${fmt(debugBestOffLine)} bg=${fmt(debugBestBackground)} d=${fmt(debugBestDistanceInRoi)}"
+    }
 
     private fun initialTheta(reader: YuvReader, roi: RotatedRoi): Theta {
         val previous = previousTheta
@@ -185,43 +203,51 @@ class LedFrameDecoder {
 
     private fun refine(reader: YuvReader, roi: RotatedRoi, seed: Theta, steps: Array<Step>): Fit {
         var theta = normalizeTheta(seed, roi)
-        var score = scoreTheta(reader, roi, theta)
+        var breakdown = scoreBreakdown(reader, roi, theta)
+        var score = breakdown.score
         var bestTheta = theta
+        var bestBreakdown = breakdown
         var bestScore = score
 
         for (step in steps) {
-            val candidates = arrayOf(
-                theta.copy(cx = theta.cx + step.translationPx),
-                theta.copy(cx = theta.cx - step.translationPx),
-                theta.copy(cy = theta.cy + step.translationPx),
-                theta.copy(cy = theta.cy - step.translationPx),
-                theta.copy(angle = theta.angle + step.angleRad),
-                theta.copy(angle = theta.angle - step.angleRad),
-                theta.copy(logDistance = theta.logDistance + step.logDistance),
-                theta.copy(logDistance = theta.logDistance - step.logDistance),
-            )
-
             var localBestTheta = theta
+            var localBestBreakdown = breakdown
             var localBestScore = score
-            for (candidate in candidates) {
+
+            fun tryCandidate(candidate: Theta) {
                 val normalized = normalizeTheta(candidate, roi)
-                val candidateScore = scoreTheta(reader, roi, normalized)
+                val candidateBreakdown = scoreBreakdown(reader, roi, normalized)
+                val candidateScore = candidateBreakdown.score
                 if (candidateScore > localBestScore) {
                     localBestScore = candidateScore
+                    localBestBreakdown = candidateBreakdown
                     localBestTheta = normalized
                 }
             }
 
+            tryCandidate(theta.copy(cx = theta.cx + step.translationPx))
+            tryCandidate(theta.copy(cx = theta.cx - step.translationPx))
+            tryCandidate(theta.copy(cy = theta.cy + step.translationPx))
+            tryCandidate(theta.copy(cy = theta.cy - step.translationPx))
+            tryCandidate(theta.copy(angle = theta.angle + step.angleRad))
+            tryCandidate(theta.copy(angle = theta.angle - step.angleRad))
+            tryCandidate(theta.copy(logDistance = theta.logDistance + step.logDistance))
+            tryCandidate(theta.copy(logDistance = theta.logDistance - step.logDistance))
+
+            val improved = localBestScore > score
             theta = localBestTheta
+            breakdown = localBestBreakdown
             score = localBestScore
             if (score > bestScore) {
                 bestScore = score
                 bestTheta = theta
+                bestBreakdown = breakdown
             }
+            if (!improved && isAccepted(bestBreakdown, bestScore)) break
         }
 
         val confidence = sigmoid((bestScore - SCORE_THRESHOLD) / SCORE_CONFIDENCE_WIDTH)
-        return Fit(bestTheta, bestScore, confidence)
+        return Fit(bestTheta, bestBreakdown, confidence)
     }
 
     private fun normalizeTheta(theta: Theta, roi: RotatedRoi): Theta {
@@ -233,17 +259,17 @@ class LedFrameDecoder {
         )
     }
 
-    private fun isAccepted(reader: YuvReader, roi: RotatedRoi, fit: Fit): Boolean {
+    private fun isAccepted(fit: Fit): Boolean {
         if (fit.score < SCORE_THRESHOLD || fit.confidence < ACCEPT_CONFIDENCE) return false
-        val parts = scoreBreakdown(reader, roi, fit.theta)
+        return isAccepted(fit.breakdown, fit.score)
+    }
+
+    private fun isAccepted(parts: ScoreBreakdown, score: Float): Boolean {
+        if (score < SCORE_THRESHOLD) return false
         return parts.square >= MIN_ACCEPT_SQUARE &&
             parts.triangle >= MIN_ACCEPT_TRIANGLE &&
             parts.background <= MAX_ACCEPT_BACKGROUND &&
             parts.offLine <= MAX_ACCEPT_OFFLINE
-    }
-
-    private fun scoreTheta(reader: YuvReader, roi: RotatedRoi, theta: Theta): Float {
-        return scoreBreakdown(reader, roi, theta).score
     }
 
     private fun scoreBreakdown(reader: YuvReader, roi: RotatedRoi, theta: Theta): ScoreBreakdown {
@@ -268,8 +294,12 @@ class LedFrameDecoder {
 
         if (score > debugBestScore) {
             debugBestScore = score
-            debugBestLine = "best score=${fmt(score)} sq=${fmt(square.score)} tri=${fmt(triangle.score)} led=${fmt(ledLine.score)}"
-            debugBestLine += " off=${fmt(ledLine.penalty)} bg=${fmt(background)} d=${fmt(markerDistanceInRoi)}"
+            debugBestSquare = square.score
+            debugBestTriangle = triangle.score
+            debugBestLed = ledLine.score
+            debugBestOffLine = ledLine.penalty
+            debugBestBackground = background
+            debugBestDistanceInRoi = markerDistanceInRoi
         }
         return ScoreBreakdown(
             score = score,
@@ -291,7 +321,9 @@ class LedFrameDecoder {
         val markerSize = distance / constants.markerDistanceToSizeRatio()
         val start = ImagePoint(theta.cx - ux * distance * 0.5f, theta.cy - uy * distance * 0.5f)
         val end = ImagePoint(theta.cx + ux * distance * 0.5f, theta.cy + uy * distance * 0.5f)
-        val slots = constants.slotFractions().map { fraction ->
+        val slotFractions = constants.slotFractions
+        val slots = Array(slotFractions.size) { index ->
+            val fraction = slotFractions[index]
             ImagePoint(start.x + ux * distance * fraction, start.y + uy * distance * fraction)
         }
         return PatternModel(
@@ -312,29 +344,30 @@ class LedFrameDecoder {
 
     private fun modelInsideRoi(reader: YuvReader, roi: RotatedRoi, model: PatternModel): Boolean {
         val margin = max(2f, model.markerSizePx * 0.58f)
-        val points = model.slots + model.start + model.end
-        return points.all { point ->
-            if (point.x < margin || point.x >= reader.width - margin || point.y < margin || point.y >= reader.height - margin) {
-                return@all false
-            }
-            val rotated = reader.imageToRotated(point)
-            rotated.x >= roi.left + margin &&
-                rotated.x <= roi.left + roi.width - margin &&
-                rotated.y >= roi.top + margin &&
-                rotated.y <= roi.top + roi.height - margin
+        for (slot in model.slots) {
+            if (!pointInsideRoi(reader, roi, slot, margin)) return false
         }
+        return pointInsideRoi(reader, roi, model.start, margin) &&
+            pointInsideRoi(reader, roi, model.end, margin)
+    }
+
+    private fun pointInsideRoi(reader: YuvReader, roi: RotatedRoi, point: ImagePoint, margin: Float): Boolean {
+        if (point.x < margin || point.x >= reader.width - margin || point.y < margin || point.y >= reader.height - margin) {
+            return false
+        }
+        val rotated = reader.imageToRotated(point)
+        return rotated.x >= roi.left + margin &&
+            rotated.x <= roi.left + roi.width - margin &&
+            rotated.y >= roi.top + margin &&
+            rotated.y <= roi.top + roi.height - margin
     }
 
     private fun squareTemplateScore(reader: YuvReader, model: PatternModel): MarkerScore {
         val size = model.squareSizePx
         val radius = sampleRadius(size)
-        val inside = squareInsideSamples.map { markerValue(reader, model.start.local(model, it.x, it.y, size), radius) }
-        val outside = squareOutsideSamples.map { markerValue(reader, model.start.local(model, it.x, it.y, size), radius) }
-        val corners = squareCornerSamples.map { markerValue(reader, model.start.local(model, it.x, it.y, size), radius) }
-
-        val insideMean = inside.averageFloat()
-        val outsideMean = outside.averageFloat()
-        val cornerMin = corners.minOrNull() ?: 0f
+        val insideMean = markerMean(reader, model, model.start, squareInsideSamples, size, radius)
+        val outsideMean = markerMean(reader, model, model.start, squareOutsideSamples, size, radius)
+        val cornerMin = markerMin(reader, model, model.start, squareCornerSamples, size, radius)
         val edgeContrast = (insideMean - outsideMean).coerceIn(0f, 1f)
         val fill = min(insideMean, cornerMin + 0.12f)
         val compact = (markerValue(reader, model.start, radius) - cornerMin - 0.18f).coerceIn(0f, 1f)
@@ -348,15 +381,10 @@ class LedFrameDecoder {
     private fun triangleTemplateScore(reader: YuvReader, model: PatternModel): MarkerScore {
         val size = model.triangleSizePx
         val radius = sampleRadius(size)
-        val inside = triangleInsideSamples.map { markerValue(reader, model.end.local(model, it.x, it.y, size), radius) }
-        val base = triangleBaseSamples.map { markerValue(reader, model.end.local(model, it.x, it.y, size), radius) }
-        val outside = triangleOutsideSamples.map { markerValue(reader, model.end.local(model, it.x, it.y, size), radius) }
-        val upperEmpty = triangleUpperEmptySamples.map { markerValue(reader, model.end.local(model, it.x, it.y, size), radius) }
-
-        val insideMean = inside.averageFloat()
-        val baseMean = base.averageFloat()
-        val outsideMean = outside.averageFloat()
-        val upperMean = upperEmpty.averageFloat()
+        val insideMean = markerMean(reader, model, model.end, triangleInsideSamples, size, radius)
+        val baseMean = markerMean(reader, model, model.end, triangleBaseSamples, size, radius)
+        val outsideMean = markerMean(reader, model, model.end, triangleOutsideSamples, size, radius)
+        val upperMean = markerMean(reader, model, model.end, triangleUpperEmptySamples, size, radius)
         val contrast = (insideMean - outsideMean).coerceIn(0f, 1f)
         val taper = (baseMean - upperMean).coerceIn(0f, 1f)
         val fill = min(insideMean, baseMean + 0.10f)
@@ -391,11 +419,18 @@ class LedFrameDecoder {
 
     private fun backgroundPenalty(reader: YuvReader, model: PatternModel): Float {
         val fractions = floatArrayOf(0.06f, 0.15f, 0.27f, 0.38f, 0.50f, 0.62f, 0.73f, 0.85f, 0.94f)
-        val slotFractions = constants.slotFractions()
+        val slotFractions = constants.slotFractions
         var sum = 0f
         var count = 0
         for (fraction in fractions) {
-            if (slotFractions.any { abs(it - fraction) < 0.040f }) continue
+            var isSlot = false
+            for (slotFraction in slotFractions) {
+                if (abs(slotFraction - fraction) < 0.040f) {
+                    isSlot = true
+                    break
+                }
+            }
+            if (isSlot) continue
             val p = ImagePoint(
                 model.start.x + model.ux * model.distancePx * fraction,
                 model.start.y + model.uy * model.distancePx * fraction,
@@ -452,9 +487,19 @@ class LedFrameDecoder {
     }
 
     private fun ledBitMeasurements(reader: YuvReader, model: PatternModel): List<LedBitMeasurement> {
-        val scores = model.slots.map { ledOnScore(reader, it, model.ledRadiusPx, model) }
-        val minScore = scores.minOrNull() ?: 0f
-        val maxScore = scores.maxOrNull() ?: 0f
+        val scores = FloatArray(model.slots.size)
+        var minScore = Float.POSITIVE_INFINITY
+        var maxScore = Float.NEGATIVE_INFINITY
+        for (index in model.slots.indices) {
+            val score = ledOnScore(reader, model.slots[index], model.ledRadiusPx, model)
+            scores[index] = score
+            minScore = min(minScore, score)
+            maxScore = max(maxScore, score)
+        }
+        if (scores.isEmpty()) {
+            minScore = 0f
+            maxScore = 0f
+        }
         val spread = maxScore - minScore
         val threshold = if (spread >= BIT_RELATIVE_SPREAD) {
             minScore + spread * BIT_RELATIVE_THRESHOLD_FRACTION
@@ -467,13 +512,15 @@ class LedFrameDecoder {
             append(" th=").append(fmt(threshold))
             append(" sp=").append(fmt(spread))
         }
-        return scores.map { score ->
-            LedBitMeasurement(
+        val measurements = ArrayList<LedBitMeasurement>(scores.size)
+        for (score in scores) {
+            measurements.add(LedBitMeasurement(
                 isOn = score > threshold,
                 confidence = abs(score - threshold) * 42f,
                 score = score,
-            )
+            ))
         }
+        return measurements
     }
 
     private fun ledOnScore(reader: YuvReader, center: ImagePoint, radiusPx: Float, model: PatternModel): Float {
@@ -482,12 +529,12 @@ class LedFrameDecoder {
         val side = radiusPx * 2.65f
         val centerLuma = lumaMean(reader, center, tightR)
         val centerPeak = lumaMax(reader, center, r)
-        val bgLuma = arrayOf(
-            lumaMean(reader, center.local(model, 0f, side, 1f), r),
-            lumaMean(reader, center.local(model, 0f, -side, 1f), r),
-            lumaMean(reader, center.local(model, side, 0f, 1f), r),
-            lumaMean(reader, center.local(model, -side, 0f, 1f), r),
-        ).average().toFloat()
+        val bgLuma = (
+            lumaMean(reader, center.local(model, 0f, side, 1f), r) +
+                lumaMean(reader, center.local(model, 0f, -side, 1f), r) +
+                lumaMean(reader, center.local(model, side, 0f, 1f), r) +
+                lumaMean(reader, center.local(model, -side, 0f, 1f), r)
+            ) * 0.25f
         val blue = blueObjectValue(reader, center, r)
         val lumaContrast = ((centerLuma - bgLuma - 10f) / 78f).coerceIn(-0.35f, 1.35f)
         val peakContrast = ((centerPeak - bgLuma - 18f) / 95f).coerceIn(-0.35f, 1.35f)
@@ -582,8 +629,36 @@ class LedFrameDecoder {
         return (sizePx * 0.085f).roundToInt().coerceIn(1, 4)
     }
 
-    private fun List<Float>.averageFloat(): Float {
-        return if (isEmpty()) 0f else average().toFloat()
+    private fun markerMean(
+        reader: YuvReader,
+        model: PatternModel,
+        origin: ImagePoint,
+        samples: List<LocalPoint>,
+        size: Float,
+        radius: Int,
+    ): Float {
+        if (samples.isEmpty()) return 0f
+        var sum = 0f
+        for (sample in samples) {
+            sum += markerValue(reader, origin.local(model, sample.x, sample.y, size), radius)
+        }
+        return sum / samples.size
+    }
+
+    private fun markerMin(
+        reader: YuvReader,
+        model: PatternModel,
+        origin: ImagePoint,
+        samples: List<LocalPoint>,
+        size: Float,
+        radius: Int,
+    ): Float {
+        if (samples.isEmpty()) return 0f
+        var best = Float.POSITIVE_INFINITY
+        for (sample in samples) {
+            best = min(best, markerValue(reader, origin.local(model, sample.x, sample.y, size), radius))
+        }
+        return best
     }
 
     private fun normalizeAngle(angle: Float): Float {
@@ -693,9 +768,7 @@ class LedFrameDecoder {
         private val markerDistanceMm = markerMm + markerGapMm * 2 + ledMm + stepMm * 4
         private val firstLedOffsetMm = markerMm / 2f + markerGapMm + ledMm / 2f
 
-        fun slotFractions(): List<Float> {
-            return List(5) { index -> (firstLedOffsetMm + index * stepMm) / markerDistanceMm }
-        }
+        val slotFractions: FloatArray = FloatArray(5) { index -> (firstLedOffsetMm + index * stepMm) / markerDistanceMm }
 
         fun markerDistanceToSizeRatio(): Float = markerDistanceMm / markerMm
 
