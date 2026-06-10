@@ -38,10 +38,6 @@ The score is a weighted sum:
 
 - square marker template match;
 - triangle marker template match;
-- weak LED line alignment/objectness;
-- penalties for off-line LED-like objects;
-- background clutter between expected elements;
-- penalties when markers look like blue compact LED blobs.
 
 Square and triangle templates are evaluated in normalized marker coordinates. They use positive interior samples and negative outside samples. The square template requires filled corners; the triangle template requires a filled taper and base with empty upper side regions.
 
@@ -54,11 +50,10 @@ A pattern is emitted only when:
 - final score is above `SCORE_THRESHOLD`;
 - sigmoid confidence is above `ACCEPT_CONFIDENCE`.
 - square and triangle component scores pass individual minimum gates;
-- background clutter and off-line LED penalties stay below maximum gates.
 
 Otherwise `null` is emitted and tracking is reset after repeated misses.
 
-The LED-line component is not a hard acceptance gate. The five LEDs are data, so the pose tracker should not become easier or harder solely because more bits are currently lit. LED evidence is only a weak alignment term and a clutter penalty.
+The five LEDs are decoded only after the marker pose is accepted. They do not contribute to pose scoring.
 
 ## Bit Decoding
 

@@ -55,30 +55,10 @@ class LedFrameDecoder {
         val score: Float get() = breakdown.score
     }
 
-    private data class LedBitMeasurement(
-        val isOn: Boolean,
-        val confidence: Float,
-        val score: Float,
-    )
-
-    private data class MarkerScore(
-        val score: Float,
-        val shape: Float,
-        val antiLed: Float,
-    )
-
-    private data class LedLineScore(
-        val score: Float,
-        val penalty: Float,
-    )
-
     private data class ScoreBreakdown(
         val score: Float,
         val square: Float,
         val triangle: Float,
-        val led: Float,
-        val offLine: Float,
-        val background: Float,
     )
 
     private val constants = GeometryConstants()
@@ -94,9 +74,6 @@ class LedFrameDecoder {
     private var debugBestScore = BAD_SCORE
     private var debugBestSquare = 0f
     private var debugBestTriangle = 0f
-    private var debugBestLed = 0f
-    private var debugBestOffLine = 0f
-    private var debugBestBackground = 0f
     private var debugBestDistanceInRoi = 0f
 
     fun decode(image: ImageProxy): DetectionFrame? {
@@ -149,9 +126,6 @@ class LedFrameDecoder {
         debugBestScore = BAD_SCORE
         debugBestSquare = 0f
         debugBestTriangle = 0f
-        debugBestLed = 0f
-        debugBestOffLine = 0f
-        debugBestBackground = 0f
         debugBestDistanceInRoi = 0f
     }
 
@@ -175,8 +149,8 @@ class LedFrameDecoder {
 
     private fun debugBestLine(): String {
         if (debugBestScore == BAD_SCORE) return "best: none"
-        return "best score=${fmt(debugBestScore)} sq=${fmt(debugBestSquare)} tri=${fmt(debugBestTriangle)} led=${fmt(debugBestLed)}" +
-            " off=${fmt(debugBestOffLine)} bg=${fmt(debugBestBackground)} d=${fmt(debugBestDistanceInRoi)}"
+        return "best score=${fmt(debugBestScore)} sq=${fmt(debugBestSquare)} tri=${fmt(debugBestTriangle)}" +
+            " d=${fmt(debugBestDistanceInRoi)}"
     }
 
     private fun initialTheta(reader: YuvReader, roi: RotatedRoi): Theta {
@@ -267,47 +241,32 @@ class LedFrameDecoder {
     private fun isAccepted(parts: ScoreBreakdown, score: Float): Boolean {
         if (score < SCORE_THRESHOLD) return false
         return parts.square >= MIN_ACCEPT_SQUARE &&
-            parts.triangle >= MIN_ACCEPT_TRIANGLE &&
-            parts.background <= MAX_ACCEPT_BACKGROUND &&
-            parts.offLine <= MAX_ACCEPT_OFFLINE
+            parts.triangle >= MIN_ACCEPT_TRIANGLE
     }
 
     private fun scoreBreakdown(reader: YuvReader, roi: RotatedRoi, theta: Theta): ScoreBreakdown {
         val model = modelForTheta(theta)
         if (!modelInsideRoi(reader, roi, model)) {
-            return ScoreBreakdown(BAD_SCORE, 0f, 0f, 1f, 1f, 1f)
+            return ScoreBreakdown(BAD_SCORE, 0f, 0f)
         }
 
         val square = squareTemplateScore(reader, model)
         val triangle = triangleTemplateScore(reader, model)
-        val ledLine = ledLineScore(reader, model)
-        val background = backgroundPenalty(reader, model)
         val markerDistanceInRoi = model.distancePx / roi.width
 
-        val score = square.score * 2.95f +
-            triangle.score * 4.35f +
-            ledLine.score * 0.25f -
-            ledLine.penalty * 0.85f -
-            background * 1.65f -
-            square.antiLed * 1.55f -
-            triangle.antiLed * 1.80f
+        val score = square * 2.95f +
+            triangle * 4.35f
 
         if (score > debugBestScore) {
             debugBestScore = score
-            debugBestSquare = square.score
-            debugBestTriangle = triangle.score
-            debugBestLed = ledLine.score
-            debugBestOffLine = ledLine.penalty
-            debugBestBackground = background
+            debugBestSquare = square
+            debugBestTriangle = triangle
             debugBestDistanceInRoi = markerDistanceInRoi
         }
         return ScoreBreakdown(
             score = score,
-            square = square.score,
-            triangle = triangle.score,
-            led = ledLine.score,
-            offLine = ledLine.penalty,
-            background = background,
+            square = square,
+            triangle = triangle,
         )
     }
 
@@ -362,7 +321,7 @@ class LedFrameDecoder {
             rotated.y <= roi.top + roi.height - margin
     }
 
-    private fun squareTemplateScore(reader: YuvReader, model: PatternModel): MarkerScore {
+    private fun squareTemplateScore(reader: YuvReader, model: PatternModel): Float {
         val size = model.squareSizePx
         val radius = sampleRadius(size)
         val insideMean = markerMean(reader, model, model.start, squareInsideSamples, size, radius)
@@ -371,14 +330,12 @@ class LedFrameDecoder {
         val edgeContrast = (insideMean - outsideMean).coerceIn(0f, 1f)
         val fill = min(insideMean, cornerMin + 0.12f)
         val compact = (markerValue(reader, model.start, radius) - cornerMin - 0.18f).coerceIn(0f, 1f)
-        val blue = blueObjectValue(reader, model.start, radius + 1)
-        val score = (fill * 0.42f + edgeContrast * 0.42f + cornerMin * 0.28f - compact * 0.55f - blue * 0.45f)
+        val score = (fill * 0.42f + edgeContrast * 0.42f + cornerMin * 0.28f - compact * 0.55f)
             .coerceIn(0f, 1f)
-        val antiLed = (compact * 0.65f + blue * 0.55f).coerceIn(0f, 1f)
-        return MarkerScore(score = score, shape = fill, antiLed = antiLed)
+        return score
     }
 
-    private fun triangleTemplateScore(reader: YuvReader, model: PatternModel): MarkerScore {
+    private fun triangleTemplateScore(reader: YuvReader, model: PatternModel): Float {
         val size = model.triangleSizePx
         val radius = sampleRadius(size)
         val insideMean = markerMean(reader, model, model.end, triangleInsideSamples, size, radius)
@@ -389,64 +346,13 @@ class LedFrameDecoder {
         val taper = (baseMean - upperMean).coerceIn(0f, 1f)
         val fill = min(insideMean, baseMean + 0.10f)
         val compact = (insideMean - baseMean - 0.20f).coerceIn(0f, 1f)
-        val blue = blueObjectValue(reader, model.end, radius + 1)
-        val score = (fill * 0.36f + contrast * 0.34f + taper * 0.42f - compact * 0.62f - blue * 0.45f)
+        val score = (fill * 0.36f + contrast * 0.34f + taper * 0.42f - compact * 0.62f)
             .coerceIn(0f, 1f)
-        val antiLed = (compact * 0.72f + blue * 0.55f + max(0f, upperMean - baseMean) * 0.55f).coerceIn(0f, 1f)
-        return MarkerScore(score = score, shape = fill, antiLed = antiLed)
-    }
-
-    private fun ledLineScore(reader: YuvReader, model: PatternModel): LedLineScore {
-        var centeredSum = 0f
-        var offLinePenalty = 0f
-        val offsets = floatArrayOf(-1.4f, -0.8f, 0.8f, 1.4f)
-        for (slot in model.slots) {
-            val centered = ledObjectValue(reader, slot, model.ledRadiusPx)
-            var bestOffLine = 0f
-            for (offset in offsets) {
-                val shifted = slot.local(model, 0f, model.ledRadiusPx * offset, 1f)
-                bestOffLine = max(bestOffLine, ledObjectValue(reader, shifted, model.ledRadiusPx))
-            }
-            centeredSum += centered
-            offLinePenalty += max(0f, bestOffLine - centered - 0.06f)
-        }
-        val count = model.slots.size.toFloat().coerceAtLeast(1f)
-        return LedLineScore(
-            score = (centeredSum / count).coerceIn(0f, 1f),
-            penalty = (offLinePenalty / count).coerceIn(0f, 1f),
-        )
-    }
-
-    private fun backgroundPenalty(reader: YuvReader, model: PatternModel): Float {
-        val fractions = floatArrayOf(0.06f, 0.15f, 0.27f, 0.38f, 0.50f, 0.62f, 0.73f, 0.85f, 0.94f)
-        val slotFractions = constants.slotFractions
-        var sum = 0f
-        var count = 0
-        for (fraction in fractions) {
-            var isSlot = false
-            for (slotFraction in slotFractions) {
-                if (abs(slotFraction - fraction) < 0.040f) {
-                    isSlot = true
-                    break
-                }
-            }
-            if (isSlot) continue
-            val p = ImagePoint(
-                model.start.x + model.ux * model.distancePx * fraction,
-                model.start.y + model.uy * model.distancePx * fraction,
-            )
-            val radius = max(1, (model.ledRadiusPx * 0.65f).roundToInt())
-            sum += max(markerValue(reader, p, radius), blueObjectValue(reader, p, radius) * 0.70f)
-            count++
-        }
-        return if (count == 0) 0f else (sum / count).coerceIn(0f, 1f)
+        return score
     }
 
     private fun decodeWithModel(reader: YuvReader, model: PatternModel): DetectionFrame {
-        val measurements = ledBitMeasurements(reader, model)
-        val rawBits = buildString(capacity = 5) {
-            measurements.forEach { append(if (it.isOn) '1' else '0') }
-        }
+        val rawBits = decodeBits(reader, model)
         val overlayRadius = (model.ledRadiusPx * 1.25f).coerceIn(3.5f, 13f)
         return DetectionFrame(
             timestampNs = reader.timestampNs,
@@ -486,7 +392,7 @@ class LedFrameDecoder {
         )
     }
 
-    private fun ledBitMeasurements(reader: YuvReader, model: PatternModel): List<LedBitMeasurement> {
+    private fun decodeBits(reader: YuvReader, model: PatternModel): String {
         val scores = FloatArray(model.slots.size)
         var minScore = Float.POSITIVE_INFINITY
         var maxScore = Float.NEGATIVE_INFINITY
@@ -512,15 +418,11 @@ class LedFrameDecoder {
             append(" th=").append(fmt(threshold))
             append(" sp=").append(fmt(spread))
         }
-        val measurements = ArrayList<LedBitMeasurement>(scores.size)
-        for (score in scores) {
-            measurements.add(LedBitMeasurement(
-                isOn = score > threshold,
-                confidence = abs(score - threshold) * 42f,
-                score = score,
-            ))
+        return buildString(capacity = scores.size) {
+            for (score in scores) {
+                append(if (score > threshold) '1' else '0')
+            }
         }
-        return measurements
     }
 
     private fun ledOnScore(reader: YuvReader, center: ImagePoint, radiusPx: Float, model: PatternModel): Float {
@@ -792,8 +694,6 @@ class LedFrameDecoder {
         const val BIT_ABSOLUTE_ON_THRESHOLD = 0.62f
         const val MIN_ACCEPT_SQUARE = 0.62f
         const val MIN_ACCEPT_TRIANGLE = 0.38f
-        const val MAX_ACCEPT_BACKGROUND = 0.34f
-        const val MAX_ACCEPT_OFFLINE = 0.18f
         const val BAD_SCORE = -1_000_000f
 
         val ACQUIRE_STEPS = arrayOf(
