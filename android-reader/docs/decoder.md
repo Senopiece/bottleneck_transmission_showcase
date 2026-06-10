@@ -1,0 +1,65 @@
+# LED Marker Decoder
+
+The decoder assumes the user manually places the physical pattern near the center of the reader ROI. The algorithm only corrects small placement errors.
+
+## Pose
+
+The optimized pose is:
+
+- `cx`, `cy`: center of the whole pattern, halfway between square and triangle marker centers.
+- `angle`: pattern axis angle around `cx/cy`.
+- `logDistance`: log of the distance between square center and triangle center.
+
+`logDistance` is used instead of raw distance so scale updates are multiplicative and bounded.
+
+When tracking is continuous, the previous accepted pose is used as the seed. Otherwise, the seed is the ideal centered pose in the ROI with pattern width close to the expected user framing.
+
+## Optimization
+
+The current implementation uses a fixed small coordinate-ascent schedule, not a full image scan:
+
+1. Evaluate the current pose.
+2. For each step size, test `+/- x`, `+/- y`, `+/- angle`, and `+/- logDistance`.
+3. Move to the best candidate if it improves the score.
+4. Repeat for a fixed decreasing step schedule.
+
+There is no convergence-based early stop. This keeps frame cost predictable.
+
+There are two schedules:
+
+- acquire: wider steps from the ideal ROI-centered pose;
+- tracking: smaller steps from the previous accepted pose, so the tracker does not drift aggressively onto nearby UI/text.
+
+## Score
+
+The score is a weighted sum:
+
+- square marker template match;
+- triangle marker template match;
+- weak LED line alignment/objectness;
+- penalties for off-line LED-like objects;
+- background clutter between expected elements;
+- penalties when markers look like blue compact LED blobs.
+
+Square and triangle templates are evaluated in normalized marker coordinates. They use positive interior samples and negative outside samples. The square template requires filled corners; the triangle template requires a filled taper and base with empty upper side regions.
+
+The score is intentionally geometric and local. It does not run Canny/Sobel contours or global connected-component analysis.
+
+## Acceptance
+
+A pattern is emitted only when:
+
+- final score is above `SCORE_THRESHOLD`;
+- sigmoid confidence is above `ACCEPT_CONFIDENCE`.
+- square and triangle component scores pass individual minimum gates;
+- background clutter and off-line LED penalties stay below maximum gates.
+
+Otherwise `null` is emitted and tracking is reset after repeated misses.
+
+The LED-line component is not a hard acceptance gate. The five LEDs are data, so the pose tracker should not become easier or harder solely because more bits are currently lit. LED evidence is only a weak alignment term and a clutter penalty.
+
+## Bit Decoding
+
+Bits are decoded from the five expected LED slots after the pose is accepted.
+
+The decoder computes five per-slot on-scores, then chooses a threshold relative to the current row if there is enough spread. If all five slots look similar, it falls back to an absolute on threshold for `00000` / `11111` cases.
