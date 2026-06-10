@@ -47,8 +47,7 @@ The score is intentionally geometric and local. It does not run Canny/Sobel cont
 
 A pattern is emitted only when:
 
-- final score is above `SCORE_THRESHOLD`;
-- sigmoid confidence is above `ACCEPT_CONFIDENCE`.
+- final score is above `MIN_ACCEPT_SCORE`;
 - square and triangle component scores pass individual minimum gates;
 
 Otherwise `null` is emitted and tracking is reset after repeated misses.
@@ -59,4 +58,4 @@ The five LEDs are decoded only after the marker pose is accepted. They do not co
 
 Bits are decoded from the five expected LED slots after the pose is accepted.
 
-The decoder computes five per-slot on-scores, then chooses a threshold relative to the current row if there is enough spread. If all five slots look similar, it falls back to an absolute on threshold for `00000` / `11111` cases.
+The decoder computes five per-slot on-scores and compares each score with the fixed `BIT_ABSOLUTE_ON_THRESHOLD`.

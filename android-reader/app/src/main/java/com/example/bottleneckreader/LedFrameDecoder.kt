@@ -50,7 +50,6 @@ class LedFrameDecoder {
     private data class Fit(
         val theta: Theta,
         val breakdown: ScoreBreakdown,
-        val confidence: Float,
     ) {
         val score: Float get() = breakdown.score
     }
@@ -67,7 +66,7 @@ class LedFrameDecoder {
         private set
 
     private var previousTheta: Theta? = null
-    private var previousConfidence = 0f
+    private var previousScore = 0f
     private var missedFrames = 0
     private var debugModeLine = "mode: none"
     private var debugBitsLine = "bitScore: none"
@@ -84,28 +83,28 @@ class LedFrameDecoder {
         val seed = initialTheta(reader, roi)
         val tracking = previousTheta != null && missedFrames <= TRACKING_CONTINUITY_MISSES
         debugModeLine = if (tracking) {
-            "mode: tracking prevConf=${fmt(previousConfidence)} missed=$missedFrames"
+            "mode: tracking prevScore=${fmt(previousScore)} missed=$missedFrames"
         } else {
             "mode: acquire centered"
         }
 
         var fit = refine(reader, roi, seed, if (tracking) TRACKING_STEPS else ACQUIRE_STEPS)
         if (tracking && !isAccepted(fit)) {
-            debugModeLine = "mode: tracking fallback prevConf=${fmt(previousConfidence)} missed=$missedFrames"
+            debugModeLine = "mode: tracking fallback prevScore=${fmt(previousScore)} missed=$missedFrames"
             fit = refine(reader, roi, centeredTheta(reader, roi), ACQUIRE_STEPS)
         }
         if (!isAccepted(fit)) {
             missedFrames++
             if (missedFrames >= RESET_AFTER_MISSES) {
                 previousTheta = null
-                previousConfidence = 0f
+                previousScore = 0f
             }
             finishDebugFrame("MISS", fit, null)
             return null
         }
 
         previousTheta = fit.theta
-        previousConfidence = fit.confidence
+        previousScore = fit.score
         missedFrames = 0
 
         val frame = decodeWithModel(reader, modelForTheta(fit.theta))
@@ -115,7 +114,7 @@ class LedFrameDecoder {
 
     fun resetTracking() {
         previousTheta = null
-        previousConfidence = 0f
+        previousScore = 0f
         missedFrames = 0
         lastDebugLines = emptyList()
     }
@@ -134,13 +133,12 @@ class LedFrameDecoder {
         lines.add("$status bits=${bits ?: "null"}")
         lines.add(debugModeLine)
         if (fit != null) {
-            lines.add("fit score=${fmt(fit.score)} conf=${fmt(fit.confidence)} d=${fmt(fit.theta.distance)} angle=${fmt(fit.theta.angle)}")
+            lines.add("fit score=${fmt(fit.score)} d=${fmt(fit.theta.distance)} angle=${fmt(fit.theta.angle)}")
         } else {
-            lines.add("fit: none prevConf=${fmt(previousConfidence)} missed=$missedFrames")
+            lines.add("fit: none prevScore=${fmt(previousScore)} missed=$missedFrames")
         }
         lines.add(debugBestLine())
         lines.add(debugBitsLine)
-        lines.add("threshold score=$SCORE_THRESHOLD accept=$ACCEPT_CONFIDENCE")
         lastDebugLines = lines
         return lines
     }
@@ -220,8 +218,7 @@ class LedFrameDecoder {
             if (!improved && isAccepted(bestBreakdown, bestScore)) break
         }
 
-        val confidence = sigmoid((bestScore - SCORE_THRESHOLD) / SCORE_CONFIDENCE_WIDTH)
-        return Fit(bestTheta, bestBreakdown, confidence)
+        return Fit(bestTheta, bestBreakdown)
     }
 
     private fun normalizeTheta(theta: Theta, roi: RotatedRoi): Theta {
@@ -234,12 +231,11 @@ class LedFrameDecoder {
     }
 
     private fun isAccepted(fit: Fit): Boolean {
-        if (fit.score < SCORE_THRESHOLD || fit.confidence < ACCEPT_CONFIDENCE) return false
         return isAccepted(fit.breakdown, fit.score)
     }
 
     private fun isAccepted(parts: ScoreBreakdown, score: Float): Boolean {
-        if (score < SCORE_THRESHOLD) return false
+        if (score < MIN_ACCEPT_SCORE) return false
         return parts.square >= MIN_ACCEPT_SQUARE &&
             parts.triangle >= MIN_ACCEPT_TRIANGLE
     }
@@ -394,33 +390,17 @@ class LedFrameDecoder {
 
     private fun decodeBits(reader: YuvReader, model: PatternModel): String {
         val scores = FloatArray(model.slots.size)
-        var minScore = Float.POSITIVE_INFINITY
-        var maxScore = Float.NEGATIVE_INFINITY
         for (index in model.slots.indices) {
-            val score = ledOnScore(reader, model.slots[index], model.ledRadiusPx, model)
-            scores[index] = score
-            minScore = min(minScore, score)
-            maxScore = max(maxScore, score)
-        }
-        if (scores.isEmpty()) {
-            minScore = 0f
-            maxScore = 0f
-        }
-        val spread = maxScore - minScore
-        val threshold = if (spread >= BIT_RELATIVE_SPREAD) {
-            minScore + spread * BIT_RELATIVE_THRESHOLD_FRACTION
-        } else {
-            BIT_ABSOLUTE_ON_THRESHOLD
+            scores[index] = ledOnScore(reader, model.slots[index], model.ledRadiusPx, model)
         }
         debugBitsLine = buildString {
             append("bitScore")
             scores.forEach { append(' ').append(fmt(it)) }
-            append(" th=").append(fmt(threshold))
-            append(" sp=").append(fmt(spread))
+            append(" th=").append(fmt(BIT_ABSOLUTE_ON_THRESHOLD))
         }
         return buildString(capacity = scores.size) {
             for (score in scores) {
-                append(if (score > threshold) '1' else '0')
+                append(if (score > BIT_ABSOLUTE_ON_THRESHOLD) '1' else '0')
             }
         }
     }
@@ -571,10 +551,6 @@ class LedFrameDecoder {
         return a
     }
 
-    private fun sigmoid(value: Float): Float {
-        return (1.0 / (1.0 + exp(-value.toDouble()))).toFloat()
-    }
-
     private data class LocalPoint(val x: Float, val y: Float)
 
     private data class Step(val translationPx: Float, val angleRad: Float, val logDistance: Float)
@@ -684,13 +660,9 @@ class LedFrameDecoder {
     private companion object {
         const val RESET_AFTER_MISSES = 4
         const val TRACKING_CONTINUITY_MISSES = 1
-        const val ACCEPT_CONFIDENCE = 0.50f
-        const val SCORE_THRESHOLD = 3.25f
-        const val SCORE_CONFIDENCE_WIDTH = 0.42f
+        const val MIN_ACCEPT_SCORE = 6.0f
         const val INITIAL_PATTERN_DISTANCE_FRACTION = 0.82f
         const val MIN_PATTERN_DISTANCE_PX = 32f
-        const val BIT_RELATIVE_SPREAD = 0.16f
-        const val BIT_RELATIVE_THRESHOLD_FRACTION = 0.48f
         const val BIT_ABSOLUTE_ON_THRESHOLD = 0.62f
         const val MIN_ACCEPT_SQUARE = 0.62f
         const val MIN_ACCEPT_TRIANGLE = 0.38f
