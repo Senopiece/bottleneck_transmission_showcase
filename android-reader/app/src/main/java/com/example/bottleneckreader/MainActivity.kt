@@ -47,6 +47,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
@@ -271,6 +272,14 @@ private fun DetectionOverlay(
             style = Stroke(width = 1.5.dp.toPx()),
         )
 
+        if (frame.isAcquireMode()) {
+            drawAcquireGuidePattern(
+                roiTopLeft = roiTopLeft,
+                roiSize = Size(roiWidth, roiHeight),
+                strokeWidth = 1.5.dp.toPx(),
+            )
+        }
+
         val current = frame ?: return@Canvas
         val overlay = current.toOverlay(size)
         overlay.markers.forEach { marker ->
@@ -348,6 +357,76 @@ private fun DecodedBadgeBelowRoi(value: String) {
                 .align(Alignment.TopCenter)
                 .padding(top = topOffset),
         )
+    }
+}
+
+private fun DetectionFrame?.isAcquireMode(): Boolean {
+    return this?.debugLines?.any { it.startsWith("mode: acquire") } == true
+}
+
+private fun DrawScope.drawAcquireGuidePattern(
+    roiTopLeft: Offset,
+    roiSize: Size,
+    strokeWidth: Float,
+) {
+    val distance = roiSize.width * AcquireGuideGeometry.patternDistanceFraction
+    val markerSize = distance / AcquireGuideGeometry.markerDistanceToSizeRatio
+    val ledRadius = markerSize * AcquireGuideGeometry.ledRadiusToMarkerSizeRatio
+    val squareSize = markerSize * AcquireGuideGeometry.squareSizeToMarkerSizeRatio
+    val triangleSize = markerSize * AcquireGuideGeometry.triangleSizeToMarkerSizeRatio
+    val center = Offset(
+        x = roiTopLeft.x + roiSize.width * 0.5f,
+        y = roiTopLeft.y + roiSize.height * 0.5f,
+    )
+    val start = Offset(center.x - distance * 0.5f, center.y)
+    val triangleCenter = Offset(center.x + distance * 0.5f, center.y)
+    val markerColor = Color(0x70E8EAEE)
+    val ledColor = Color(0x60E8EAEE)
+
+    AcquireGuideGeometry.slotFractions.forEach { fraction ->
+        drawCircle(
+            color = ledColor,
+            radius = ledRadius,
+            center = Offset(start.x + distance * fraction, center.y),
+            style = Stroke(width = strokeWidth),
+        )
+    }
+
+    val half = triangleSize * 0.32f
+    val triangle = Path().apply {
+        moveTo(triangleCenter.x, triangleCenter.y - half)
+        lineTo(triangleCenter.x + half * 0.92f, triangleCenter.y + half)
+        lineTo(triangleCenter.x - half * 0.92f, triangleCenter.y + half)
+        close()
+    }
+    drawRect(
+        color = markerColor,
+        topLeft = Offset(start.x - squareSize * 0.5f, start.y - squareSize * 0.5f),
+        size = Size(squareSize, squareSize),
+        style = Stroke(width = strokeWidth),
+    )
+    drawPath(path = triangle, color = markerColor, style = Stroke(width = strokeWidth))
+}
+
+private object AcquireGuideGeometry {
+    private const val ledMm = 3f
+    private const val gapMm = 2.5f
+    private const val markerMm = 4f
+    private const val squareMm = ledMm + 0.45f
+    private const val triangleMm = ledMm + 2f
+    private const val markerGapMm = 4f
+    private const val stepMm = ledMm + gapMm
+    private const val markerDistanceMm = markerMm + markerGapMm * 2f + ledMm + stepMm * 4f
+    private const val firstLedOffsetMm = markerMm / 2f + markerGapMm + ledMm / 2f
+
+    const val patternDistanceFraction = 0.76f
+    const val markerDistanceToSizeRatio = markerDistanceMm / markerMm
+    const val ledRadiusToMarkerSizeRatio = (ledMm * 0.5f) / markerMm
+    const val squareSizeToMarkerSizeRatio = squareMm / markerMm
+    const val triangleSizeToMarkerSizeRatio = triangleMm / markerMm
+
+    val slotFractions: FloatArray = FloatArray(5) { index ->
+        (firstLedOffsetMm + index * stepMm) / markerDistanceMm
     }
 }
 
