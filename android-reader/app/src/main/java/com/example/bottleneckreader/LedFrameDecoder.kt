@@ -84,7 +84,7 @@ class LedFrameDecoder {
         val seed = initialTheta(reader, roi)
         val tracking = previousTheta != null && missedFrames <= TRACKING_CONTINUITY_MISSES
         isAcquireMode = !tracking
-        if (BuildConfig.LED_DIAGNOSTICS) {
+        if (Diagnostics.enabled) {
             debugModeLine = if (tracking) {
                 "mode: tracking prevScore=${fmt(previousScore)} missed=$missedFrames"
             } else {
@@ -95,7 +95,7 @@ class LedFrameDecoder {
         var fit = refine(reader, roi, seed, if (tracking) TRACKING_STEPS else ACQUIRE_STEPS)
         if (tracking && !isAccepted(fit)) {
             isAcquireMode = true
-            if (BuildConfig.LED_DIAGNOSTICS) {
+            if (Diagnostics.enabled) {
                 debugModeLine = "mode: tracking fallback prevScore=${fmt(previousScore)} missed=$missedFrames"
             }
             fit = refine(reader, roi, centeredTheta(reader, roi), ACQUIRE_STEPS)
@@ -129,7 +129,7 @@ class LedFrameDecoder {
     }
 
     private fun beginDebugFrame() {
-        if (!BuildConfig.LED_DIAGNOSTICS) return
+        if (!Diagnostics.enabled) return
         debugModeLine = "mode: none"
         debugBitsLine = "ledScore: none"
         debugBestScore = BAD_SCORE
@@ -139,7 +139,7 @@ class LedFrameDecoder {
     }
 
     private fun finishDebugFrame(status: String, fit: Fit?): List<String> {
-        if (!BuildConfig.LED_DIAGNOSTICS) {
+        if (!Diagnostics.enabled) {
             lastDebugLines = emptyList()
             return emptyList()
         }
@@ -267,7 +267,7 @@ class LedFrameDecoder {
         val score = square * 2.95f +
             triangle * 4.35f
 
-        if (BuildConfig.LED_DIAGNOSTICS && score > debugBestScore) {
+        if (Diagnostics.enabled && score > debugBestScore) {
             debugBestScore = score
             debugBestSquare = square
             debugBestTriangle = triangle
@@ -412,7 +412,7 @@ class LedFrameDecoder {
         for (index in model.slots.indices) {
             scores[index] = ledOnScore(reader, model.slots[index], model.ledRadiusPx, model)
         }
-        if (BuildConfig.LED_DIAGNOSTICS) {
+        if (Diagnostics.enabled) {
             debugBitsLine = buildString {
                 append("ledScore")
                 scores.forEach { append(' ').append(fmt(it)) }

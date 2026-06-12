@@ -200,7 +200,7 @@ class CameraReader(
 
             val elapsedNs = System.nanoTime() - started
             val elapsedMs = elapsedNs / 1_000_000f
-            if (BuildConfig.LED_DIAGNOSTICS) {
+            if (Diagnostics.enabled) {
                 eventSink(ReaderEvent.DecoderTiming(elapsedMs))
             }
             updateWatchdog((elapsedNs / 1_000_000).coerceAtLeast(0))

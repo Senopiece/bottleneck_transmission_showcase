@@ -1,6 +1,5 @@
 package com.example.bottleneckreader
 
-import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.delay
@@ -9,14 +8,13 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
-import java.util.Locale
 import java.util.concurrent.atomic.AtomicLong
 
 class ReaderViewModel : ViewModel() {
     private val ids = AtomicLong(0)
     private val packetIds = AtomicLong(0)
     private val debouncer = LedDebouncer()
-    private var csvHeaderLogged = false
+    private val scoreLogger = ScoreLogger()
 
     private val _frame = MutableStateFlow<DetectionFrame?>(null)
     val frame: StateFlow<DetectionFrame?> = _frame.asStateFlow()
@@ -98,7 +96,9 @@ class ReaderViewModel : ViewModel() {
         _frame.value = frame
         val scores = frame.ledScores.takeIf { it.size == LED_COUNT }
         val event = debouncer.accept(scores)
-        logScoreCsv(frame.timestampNs, scores, event)
+        if (Diagnostics.enabled) {
+            scoreLogger.log(frame.timestampNs, scores, event)
+        }
         event?.let { result ->
             appendPacketEvent(frame.timestampNs, result.bits)
         }
@@ -106,7 +106,9 @@ class ReaderViewModel : ViewModel() {
 
     private fun resetDebouncer(timestampNs: Long) {
         val event = debouncer.reset()
-        logScoreCsv(timestampNs, null, event)
+        if (Diagnostics.enabled) {
+            scoreLogger.log(timestampNs, null, event)
+        }
         event?.let { result ->
             appendPacketEvent(timestampNs, result.bits)
         }
@@ -122,7 +124,7 @@ class ReaderViewModel : ViewModel() {
     }
 
     private fun onDecoderTiming(elapsedMs: Float) {
-        if (!BuildConfig.LED_DIAGNOSTICS) return
+        if (!Diagnostics.enabled) return
         _decoderTiming.update { current ->
             val samples = (current.samplesMs + elapsedMs).takeLast(TIMING_WINDOW_SIZE)
             var min = Float.POSITIVE_INFINITY
@@ -142,37 +144,10 @@ class ReaderViewModel : ViewModel() {
         }
     }
 
-    private fun logScoreCsv(
-        timestampNs: Long,
-        scores: FloatArray?,
-        event: LedDebouncer.Result?,
-    ) {
-        if (!BuildConfig.LED_DIAGNOSTICS) return
-        if (!csvHeaderLogged) {
-            Log.d(SCORE_CSV_TAG, "timestampNs,detected,s0,s1,s2,s3,s4,event")
-            csvHeaderLogged = true
-        }
-        val eventValue = when {
-            event == null -> ""
-            event.bits == null -> "null"
-            else -> event.bits
-        }
-        val scoreColumns = if (scores == null) {
-            ",,,,"
-        } else {
-            scores.joinToString(separator = ",") { String.format(Locale.US, "%.4f", it) }
-        }
-        Log.d(
-            SCORE_CSV_TAG,
-            "$timestampNs,${if (scores == null) 0 else 1},$scoreColumns,$eventValue",
-        )
-    }
-
     private companion object {
         const val LED_COUNT = 5
         const val MAX_PACKET_EVENTS = 3
         const val TIMING_WINDOW_SIZE = 90
-        const val SCORE_CSV_TAG = "LedScoresCsv"
         const val NOTICE_VISIBLE_MS = 3_200L
         const val NOTICE_EXIT_MS = 420L
     }

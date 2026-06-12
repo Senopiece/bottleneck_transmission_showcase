@@ -22,11 +22,8 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
-import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
@@ -131,7 +128,6 @@ private fun ReaderApp(viewModel: ReaderViewModel = viewModel()) {
     val frame by viewModel.frame.collectAsStateWithLifecycle()
     val notices by viewModel.notices.collectAsStateWithLifecycle()
     val packetEvents by viewModel.packetEvents.collectAsStateWithLifecycle()
-    val decoderTiming by viewModel.decoderTiming.collectAsStateWithLifecycle()
     val problem by viewModel.problem.collectAsStateWithLifecycle()
     val restartToken by viewModel.restartToken.collectAsStateWithLifecycle()
 
@@ -151,17 +147,7 @@ private fun ReaderApp(viewModel: ReaderViewModel = viewModel()) {
 
         PacketEventsBelowRoi(events = packetEvents)
 
-        if (BuildConfig.LED_DIAGNOSTICS) {
-            Column(
-                modifier = Modifier
-                    .align(Alignment.TopStart)
-                    .padding(top = 18.dp, start = 12.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                DebugPanel(lines = frame?.debugLines.orEmpty())
-                DecoderTimingPanel(timing = decoderTiming)
-            }
-        }
+        DiagnosticsOverlay(viewModel = viewModel, frame = frame)
 
         NoticeQueue(
             notices = notices,
@@ -204,92 +190,6 @@ private fun ReaderApp(viewModel: ReaderViewModel = viewModel()) {
                 }
             },
         )
-    }
-}
-
-@Composable
-private fun DecoderTimingPanel(
-    timing: DecoderTimingWindow,
-    modifier: Modifier = Modifier,
-) {
-    if (timing.samplesMs.isEmpty()) return
-    Row(
-        modifier = modifier
-            .background(Color(0xB8000000), RoundedCornerShape(6.dp))
-            .padding(horizontal = 10.dp, vertical = 8.dp),
-        horizontalArrangement = Arrangement.spacedBy(10.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Canvas(
-            modifier = Modifier
-                .width(210.dp)
-                .height(58.dp),
-        ) {
-            val samples = timing.samplesMs
-            if (samples.size < 2) return@Canvas
-            val maxValue = maxOf(timing.maxMs, 1f)
-            val path = Path()
-            samples.forEachIndexed { index, sample ->
-                val x = size.width * index / (samples.lastIndex).coerceAtLeast(1)
-                val y = size.height - (sample / maxValue).coerceIn(0f, 1f) * size.height
-                if (index == 0) {
-                    path.moveTo(x, y)
-                } else {
-                    path.lineTo(x, y)
-                }
-            }
-            drawRect(
-                color = Color(0x55E8EAEE),
-                size = size,
-                style = Stroke(width = 1.dp.toPx()),
-            )
-            drawPath(
-                path = path,
-                color = Color(0xFFFFEB3B),
-                style = Stroke(width = 1.6.dp.toPx()),
-            )
-        }
-        Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-            TimingLabel("avg", timing.avgMs)
-            TimingLabel("max", timing.maxMs)
-            TimingLabel("min", timing.minMs)
-        }
-    }
-}
-
-@Composable
-private fun TimingLabel(label: String, value: Float) {
-    Text(
-        text = "$label ${String.format(java.util.Locale.US, "%.1f", value)} ms",
-        color = Color(0xFFE8EAEE),
-        fontSize = 11.sp,
-        lineHeight = 13.sp,
-        fontWeight = FontWeight.Medium,
-    )
-}
-
-@Composable
-private fun DebugPanel(
-    lines: List<String>,
-    modifier: Modifier = Modifier,
-) {
-    if (lines.isEmpty()) return
-    Column(
-        modifier = modifier
-            .widthIn(max = 340.dp)
-            .background(Color(0xB8000000), RoundedCornerShape(6.dp))
-            .padding(horizontal = 10.dp, vertical = 8.dp),
-        verticalArrangement = Arrangement.spacedBy(2.dp),
-    ) {
-        lines.take(10).forEach { line ->
-            Text(
-                text = line,
-                color = Color(0xFFE8EAEE),
-                fontSize = 11.sp,
-                lineHeight = 13.sp,
-                fontWeight = FontWeight.Medium,
-            )
-        }
     }
 }
 
