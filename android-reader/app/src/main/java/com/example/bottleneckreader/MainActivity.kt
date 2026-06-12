@@ -239,12 +239,6 @@ private fun DetectionOverlay(
             x = (size.width - roiWidth) * 0.5f,
             y = (size.height - roiHeight) * 0.5f,
         )
-        drawRect(
-            color = Color(0xB0E8EAEE),
-            topLeft = roiTopLeft,
-            size = Size(roiWidth, roiHeight),
-            style = Stroke(width = 1.5.dp.toPx()),
-        )
 
         if (frame.isAcquireMode()) {
             drawAcquireGuidePattern(

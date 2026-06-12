@@ -15,7 +15,7 @@ import kotlin.math.roundToInt
 import kotlin.math.sin
 
 class LedFrameDecoder {
-    private data class RotatedRoi(
+    private data class RotatedSearchArea(
         val left: Float,
         val top: Float,
         val width: Float,
@@ -78,10 +78,10 @@ class LedFrameDecoder {
 
     fun decode(image: ImageProxy): DetectionFrame? {
         val reader = YuvReader(image)
-        val roi = reader.rotatedRoi()
+        val searchArea = reader.rotatedSearchArea()
         beginDebugFrame()
 
-        val seed = initialTheta(reader, roi)
+        val seed = initialTheta(reader, searchArea)
         val tracking = previousTheta != null && missedFrames <= TRACKING_CONTINUITY_MISSES
         isAcquireMode = !tracking
         if (Diagnostics.enabled) {
@@ -92,13 +92,13 @@ class LedFrameDecoder {
             }
         }
 
-        var fit = refine(reader, roi, seed, if (tracking) TRACKING_STEPS else ACQUIRE_STEPS)
+        var fit = refine(reader, searchArea, seed, if (tracking) TRACKING_STEPS else ACQUIRE_STEPS)
         if (tracking && !isAccepted(fit)) {
             isAcquireMode = true
             if (Diagnostics.enabled) {
                 debugModeLine = "mode: tracking fallback prevScore=${fmt(previousScore)} missed=$missedFrames"
             }
-            fit = refine(reader, roi, centeredTheta(reader, roi), ACQUIRE_STEPS)
+            fit = refine(reader, searchArea, centeredTheta(reader, searchArea), ACQUIRE_STEPS)
         }
         if (!isAccepted(fit)) {
             missedFrames++
@@ -165,19 +165,19 @@ class LedFrameDecoder {
             " d=${fmt(debugBestDistanceInRoi)}"
     }
 
-    private fun initialTheta(reader: YuvReader, roi: RotatedRoi): Theta {
+    private fun initialTheta(reader: YuvReader, searchArea: RotatedSearchArea): Theta {
         val previous = previousTheta
         if (previous != null && missedFrames <= TRACKING_CONTINUITY_MISSES) return previous
-        return centeredTheta(reader, roi)
+        return centeredTheta(reader, searchArea)
     }
 
-    private fun centeredTheta(reader: YuvReader, roi: RotatedRoi): Theta {
-        val rotatedCenterX = roi.left + roi.width * 0.5f
-        val rotatedCenterY = roi.top + roi.height * 0.5f
+    private fun centeredTheta(reader: YuvReader, searchArea: RotatedSearchArea): Theta {
+        val rotatedCenterX = searchArea.left + searchArea.width * 0.5f
+        val rotatedCenterY = searchArea.top + searchArea.height * 0.5f
         val center = reader.rotatedToImage(rotatedCenterX, rotatedCenterY)
         val p1 = reader.rotatedToImage(rotatedCenterX + 1f, rotatedCenterY)
         val angle = atan2(p1.y - center.y, p1.x - center.x)
-        val distance = (roi.width * INITIAL_PATTERN_DISTANCE_FRACTION)
+        val distance = (reader.guideWidth() * INITIAL_PATTERN_DISTANCE_FRACTION)
             .coerceAtLeast(MIN_PATTERN_DISTANCE_PX)
         return Theta(
             cx = center.x,
@@ -187,11 +187,12 @@ class LedFrameDecoder {
         )
     }
 
-    private fun refine(reader: YuvReader, roi: RotatedRoi, seed: Theta, steps: Array<Step>): Fit {
-        val minLogDistance = ln(max(MIN_PATTERN_DISTANCE_PX, roi.width * 0.58f))
-        val maxLogDistance = ln(roi.width * 1.02f)
+    private fun refine(reader: YuvReader, searchArea: RotatedSearchArea, seed: Theta, steps: Array<Step>): Fit {
+        val guideWidth = reader.guideWidth()
+        val minLogDistance = ln(max(MIN_PATTERN_DISTANCE_PX, guideWidth * 0.58f))
+        val maxLogDistance = ln(guideWidth * 1.02f)
         var theta = normalizeTheta(seed, minLogDistance, maxLogDistance)
-        var breakdown = scoreBreakdown(reader, roi, theta)
+        var breakdown = scoreBreakdown(reader, searchArea, theta)
         var score = breakdown.score
         var bestTheta = theta
         var bestBreakdown = breakdown
@@ -204,7 +205,7 @@ class LedFrameDecoder {
 
             fun tryCandidate(candidate: Theta) {
                 val normalized = normalizeTheta(candidate, minLogDistance, maxLogDistance)
-                val candidateBreakdown = scoreBreakdown(reader, roi, normalized)
+                val candidateBreakdown = scoreBreakdown(reader, searchArea, normalized)
                 val candidateScore = candidateBreakdown.score
                 if (candidateScore > localBestScore) {
                     localBestScore = candidateScore
@@ -254,15 +255,15 @@ class LedFrameDecoder {
             parts.triangle >= MIN_ACCEPT_TRIANGLE
     }
 
-    private fun scoreBreakdown(reader: YuvReader, roi: RotatedRoi, theta: Theta): ScoreBreakdown {
+    private fun scoreBreakdown(reader: YuvReader, searchArea: RotatedSearchArea, theta: Theta): ScoreBreakdown {
         val model = modelForTheta(theta)
-        if (!modelInsideRoi(reader, roi, model)) {
+        if (!modelInsideSearchArea(reader, searchArea, model)) {
             return ScoreBreakdown(BAD_SCORE, 0f, 0f)
         }
 
         val square = squareTemplateScore(reader, model)
         val triangle = triangleTemplateScore(reader, model)
-        val markerDistanceInRoi = model.distancePx / roi.width
+        val markerDistanceInGuide = model.distancePx / reader.guideWidth()
 
         val score = square * 2.95f +
             triangle * 4.35f
@@ -271,7 +272,7 @@ class LedFrameDecoder {
             debugBestScore = score
             debugBestSquare = square
             debugBestTriangle = triangle
-            debugBestDistanceInRoi = markerDistanceInRoi
+            debugBestDistanceInRoi = markerDistanceInGuide
         }
         return ScoreBreakdown(
             score = score,
@@ -311,24 +312,24 @@ class LedFrameDecoder {
         )
     }
 
-    private fun modelInsideRoi(reader: YuvReader, roi: RotatedRoi, model: PatternModel): Boolean {
+    private fun modelInsideSearchArea(reader: YuvReader, searchArea: RotatedSearchArea, model: PatternModel): Boolean {
         val margin = max(2f, model.markerSizePx * 0.58f)
         for (slot in model.slots) {
-            if (!pointInsideRoi(reader, roi, slot, margin)) return false
+            if (!pointInsideSearchArea(reader, searchArea, slot, margin)) return false
         }
-        return pointInsideRoi(reader, roi, model.start, margin) &&
-            pointInsideRoi(reader, roi, model.end, margin)
+        return pointInsideSearchArea(reader, searchArea, model.start, margin) &&
+            pointInsideSearchArea(reader, searchArea, model.end, margin)
     }
 
-    private fun pointInsideRoi(reader: YuvReader, roi: RotatedRoi, point: ImagePoint, margin: Float): Boolean {
+    private fun pointInsideSearchArea(reader: YuvReader, searchArea: RotatedSearchArea, point: ImagePoint, margin: Float): Boolean {
         if (point.x < margin || point.x >= reader.width - margin || point.y < margin || point.y >= reader.height - margin) {
             return false
         }
         val rotated = reader.imageToRotated(point)
-        return rotated.x >= roi.left + margin &&
-            rotated.x <= roi.left + roi.width - margin &&
-            rotated.y >= roi.top + margin &&
-            rotated.y <= roi.top + roi.height - margin
+        return rotated.x >= searchArea.left + margin &&
+            rotated.x <= searchArea.left + searchArea.width - margin &&
+            rotated.y >= searchArea.top + margin &&
+            rotated.y <= searchArea.top + searchArea.height - margin
     }
 
     private fun squareTemplateScore(reader: YuvReader, model: PatternModel): Float {
@@ -599,7 +600,7 @@ class LedFrameDecoder {
         private val uPixelStride: Int = image.planes[1].pixelStride
         private val vPixelStride: Int = image.planes[2].pixelStride
 
-        fun rotatedRoi(): RotatedRoi {
+        fun rotatedSearchArea(): RotatedSearchArea {
             val rotatedWidth = when (rotationDegrees) {
                 90, 270 -> cropHeight.toFloat()
                 else -> cropWidth.toFloat()
@@ -608,14 +609,20 @@ class LedFrameDecoder {
                 90, 270 -> cropWidth.toFloat()
                 else -> cropHeight.toFloat()
             }
-            val roiWidth = rotatedWidth * ReaderRoi.WIDTH_FRACTION
-            val roiHeight = (roiWidth * ReaderRoi.ROI_ASPECT_RATIO).coerceAtMost(rotatedHeight)
-            return RotatedRoi(
-                left = (rotatedWidth - roiWidth) * 0.5f,
-                top = (rotatedHeight - roiHeight) * 0.5f,
-                width = roiWidth,
-                height = roiHeight,
+            return RotatedSearchArea(
+                left = 0f,
+                top = 0f,
+                width = rotatedWidth,
+                height = rotatedHeight,
             )
+        }
+
+        fun guideWidth(): Float {
+            val rotatedWidth = when (rotationDegrees) {
+                90, 270 -> cropHeight.toFloat()
+                else -> cropWidth.toFloat()
+            }
+            return rotatedWidth * ReaderRoi.WIDTH_FRACTION
         }
 
         fun imageToRotated(point: ImagePoint): ImagePoint {
