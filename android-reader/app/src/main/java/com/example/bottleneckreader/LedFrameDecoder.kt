@@ -106,9 +106,10 @@ class LedFrameDecoder {
         previousScore = fit.score
         missedFrames = 0
 
-        val frame = decodeWithModel(reader, modelForTheta(fit.theta))
+        val model = modelForTheta(fit.theta)
+        val scores = readLedScores(reader, model)
         val debugLines = finishDebugFrame("HIT", fit)
-        return frame.copy(debugLines = debugLines)
+        return frameForModel(reader, model, scores, debugLines)
     }
 
     fun resetTracking() {
@@ -173,7 +174,9 @@ class LedFrameDecoder {
     }
 
     private fun refine(reader: YuvReader, roi: RotatedRoi, seed: Theta, steps: Array<Step>): Fit {
-        var theta = normalizeTheta(seed, roi)
+        val minLogDistance = ln(max(MIN_PATTERN_DISTANCE_PX, roi.width * 0.58f))
+        val maxLogDistance = ln(roi.width * 1.02f)
+        var theta = normalizeTheta(seed, minLogDistance, maxLogDistance)
         var breakdown = scoreBreakdown(reader, roi, theta)
         var score = breakdown.score
         var bestTheta = theta
@@ -186,7 +189,7 @@ class LedFrameDecoder {
             var localBestScore = score
 
             fun tryCandidate(candidate: Theta) {
-                val normalized = normalizeTheta(candidate, roi)
+                val normalized = normalizeTheta(candidate, minLogDistance, maxLogDistance)
                 val candidateBreakdown = scoreBreakdown(reader, roi, normalized)
                 val candidateScore = candidateBreakdown.score
                 if (candidateScore > localBestScore) {
@@ -220,12 +223,10 @@ class LedFrameDecoder {
         return Fit(bestTheta, bestBreakdown)
     }
 
-    private fun normalizeTheta(theta: Theta, roi: RotatedRoi): Theta {
-        val minDistance = max(MIN_PATTERN_DISTANCE_PX, roi.width * 0.58f)
-        val maxDistance = roi.width * 1.02f
+    private fun normalizeTheta(theta: Theta, minLogDistance: Float, maxLogDistance: Float): Theta {
         return theta.copy(
             angle = normalizeAngle(theta.angle),
-            logDistance = ln(theta.distance.coerceIn(minDistance, maxDistance)),
+            logDistance = theta.logDistance.coerceIn(minLogDistance, maxLogDistance),
         )
     }
 
@@ -324,7 +325,7 @@ class LedFrameDecoder {
         val cornerMin = markerMin(reader, model, model.start, squareCornerSamples, size, radius)
         val edgeContrast = (insideMean - outsideMean).coerceIn(0f, 1f)
         val fill = min(insideMean, cornerMin + 0.12f)
-        val compact = (markerValue(reader, model.start, radius) - cornerMin - 0.18f).coerceIn(0f, 1f)
+        val compact = (markerValue(reader, model.start.x, model.start.y, radius) - cornerMin - 0.18f).coerceIn(0f, 1f)
         val score = (fill * 0.42f + edgeContrast * 0.42f + cornerMin * 0.28f - compact * 0.55f)
             .coerceIn(0f, 1f)
         return score
@@ -346,8 +347,12 @@ class LedFrameDecoder {
         return score
     }
 
-    private fun decodeWithModel(reader: YuvReader, model: PatternModel): DetectionFrame {
-        val scores = readLedScores(reader, model)
+    private fun frameForModel(
+        reader: YuvReader,
+        model: PatternModel,
+        scores: FloatArray,
+        debugLines: List<String>,
+    ): DetectionFrame {
         val overlayRadius = (model.ledRadiusPx * 1.25f).coerceIn(3.5f, 13f)
         return DetectionFrame(
             timestampNs = reader.timestampNs,
@@ -358,7 +363,7 @@ class LedFrameDecoder {
             cropWidth = reader.cropWidth,
             cropHeight = reader.cropHeight,
             rotationDegrees = reader.rotationDegrees,
-            ledScores = scores.toList(),
+            ledScores = scores,
             slots = model.slots.mapIndexed { index, point ->
                 LedSlot(
                     imagePoint = point,
@@ -383,6 +388,7 @@ class LedFrameDecoder {
                     imageSize = model.triangleSizePx,
                 ),
             ),
+            debugLines = debugLines,
         )
     }
 
@@ -418,11 +424,11 @@ class LedFrameDecoder {
             .coerceIn(-0.5f, 1.6f)
     }
 
-    private fun markerValue(reader: YuvReader, center: ImagePoint, radiusPx: Int): Float {
+    private fun markerValue(reader: YuvReader, centerX: Float, centerY: Float, radiusPx: Int): Float {
         var score = 0f
         var weightSum = 0f
-        val cx = center.x.roundToInt()
-        val cy = center.y.roundToInt()
+        val cx = centerX.roundToInt()
+        val cy = centerY.roundToInt()
         for (i in SAMPLE_X.indices) {
             val x = cx + (SAMPLE_X[i] * radiusPx).roundToInt()
             val y = cy + (SAMPLE_Y[i] * radiusPx).roundToInt()
@@ -501,14 +507,14 @@ class LedFrameDecoder {
         reader: YuvReader,
         model: PatternModel,
         origin: ImagePoint,
-        samples: List<LocalPoint>,
+        samples: Array<LocalPoint>,
         size: Float,
         radius: Int,
     ): Float {
         if (samples.isEmpty()) return 0f
         var sum = 0f
         for (sample in samples) {
-            sum += markerValue(reader, origin.local(model, sample.x, sample.y, size), radius)
+            sum += markerValueAtLocal(reader, model, origin, sample, size, radius)
         }
         return sum / samples.size
     }
@@ -517,16 +523,32 @@ class LedFrameDecoder {
         reader: YuvReader,
         model: PatternModel,
         origin: ImagePoint,
-        samples: List<LocalPoint>,
+        samples: Array<LocalPoint>,
         size: Float,
         radius: Int,
     ): Float {
         if (samples.isEmpty()) return 0f
         var best = Float.POSITIVE_INFINITY
         for (sample in samples) {
-            best = min(best, markerValue(reader, origin.local(model, sample.x, sample.y, size), radius))
+            best = min(best, markerValueAtLocal(reader, model, origin, sample, size, radius))
         }
         return best
+    }
+
+    private fun markerValueAtLocal(
+        reader: YuvReader,
+        model: PatternModel,
+        origin: ImagePoint,
+        sample: LocalPoint,
+        size: Float,
+        radius: Int,
+    ): Float {
+        return markerValue(
+            reader = reader,
+            centerX = origin.x + model.ux * sample.x * size + model.vx * sample.y * size,
+            centerY = origin.y + model.uy * sample.x * size + model.vy * sample.y * size,
+            radiusPx = radius,
+        )
     }
 
     private fun normalizeAngle(angle: Float): Float {
@@ -668,7 +690,7 @@ class LedFrameDecoder {
             Step(0.8f, (0.28f * PI / 180.0).toFloat(), 0.0035f),
         )
 
-        val squareInsideSamples = listOf(
+        val squareInsideSamples = arrayOf(
             LocalPoint(0f, 0f),
             LocalPoint(-0.24f, -0.24f),
             LocalPoint(0.24f, -0.24f),
@@ -679,13 +701,13 @@ class LedFrameDecoder {
             LocalPoint(0f, -0.34f),
             LocalPoint(0f, 0.34f),
         )
-        val squareCornerSamples = listOf(
+        val squareCornerSamples = arrayOf(
             LocalPoint(-0.34f, -0.34f),
             LocalPoint(0.34f, -0.34f),
             LocalPoint(-0.34f, 0.34f),
             LocalPoint(0.34f, 0.34f),
         )
-        val squareOutsideSamples = listOf(
+        val squareOutsideSamples = arrayOf(
             LocalPoint(-0.64f, 0f),
             LocalPoint(0.64f, 0f),
             LocalPoint(0f, -0.64f),
@@ -695,7 +717,7 @@ class LedFrameDecoder {
             LocalPoint(-0.58f, 0.58f),
             LocalPoint(0.58f, 0.58f),
         )
-        val triangleInsideSamples = listOf(
+        val triangleInsideSamples = arrayOf(
             LocalPoint(0f, -0.32f),
             LocalPoint(0f, -0.06f),
             LocalPoint(0f, 0.14f),
@@ -704,18 +726,18 @@ class LedFrameDecoder {
             LocalPoint(-0.26f, 0.34f),
             LocalPoint(0.26f, 0.34f),
         )
-        val triangleBaseSamples = listOf(
+        val triangleBaseSamples = arrayOf(
             LocalPoint(-0.32f, 0.34f),
             LocalPoint(0f, 0.34f),
             LocalPoint(0.32f, 0.34f),
         )
-        val triangleUpperEmptySamples = listOf(
+        val triangleUpperEmptySamples = arrayOf(
             LocalPoint(-0.34f, -0.18f),
             LocalPoint(0.34f, -0.18f),
             LocalPoint(-0.44f, 0.02f),
             LocalPoint(0.44f, 0.02f),
         )
-        val triangleOutsideSamples = listOf(
+        val triangleOutsideSamples = arrayOf(
             LocalPoint(-0.58f, 0.06f),
             LocalPoint(0.58f, 0.06f),
             LocalPoint(-0.34f, -0.42f),

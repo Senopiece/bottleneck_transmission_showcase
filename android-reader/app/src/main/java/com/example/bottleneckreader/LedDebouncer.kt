@@ -8,7 +8,7 @@ class LedDebouncer {
     private var pendingFrames = 0
     private var bitStates: BooleanArray? = null
 
-    fun accept(scores: List<Float>?): Result? {
+    fun accept(scores: FloatArray?): Result? {
         if (scores == null || scores.size != BIT_COUNT) {
             pendingPacket = null
             pendingFrames = 0
@@ -55,7 +55,7 @@ class LedDebouncer {
         return null
     }
 
-    private fun scoresToPacket(scores: List<Float>): String {
+    private fun scoresToPacket(scores: FloatArray): String {
         val states = bitStates ?: BooleanArray(BIT_COUNT).also { fresh ->
             for (index in 0 until BIT_COUNT) {
                 fresh[index] = scores[index] >= ON_THRESHOLD

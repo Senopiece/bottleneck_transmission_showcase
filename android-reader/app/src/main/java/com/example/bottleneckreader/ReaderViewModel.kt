@@ -119,7 +119,7 @@ class ReaderViewModel : ViewModel() {
 
     private fun logScoreCsv(
         timestampNs: Long,
-        scores: List<Float>?,
+        scores: FloatArray?,
         event: LedDebouncer.Result?,
     ) {
         if (!csvHeaderLogged) {
