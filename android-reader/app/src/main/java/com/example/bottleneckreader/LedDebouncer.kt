@@ -79,8 +79,8 @@ class LedDebouncer {
 
     private companion object {
         const val BIT_COUNT = 5
-        const val REQUIRED_STABLE_FRAMES = 2
-        const val ON_THRESHOLD = 0.72f
-        const val OFF_THRESHOLD = 0.48f
+        const val REQUIRED_STABLE_FRAMES = 3
+        const val ON_THRESHOLD = 1.0f
+        const val OFF_THRESHOLD = 0.6f
     }
 }

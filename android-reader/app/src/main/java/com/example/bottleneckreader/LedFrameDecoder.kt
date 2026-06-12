@@ -685,7 +685,7 @@ class LedFrameDecoder {
     private companion object {
         const val RESET_AFTER_MISSES = 4
         const val TRACKING_CONTINUITY_MISSES = 1
-        const val MIN_ACCEPT_SCORE = 6.0f
+        const val MIN_ACCEPT_SCORE = 4.0f
         const val INITIAL_PATTERN_DISTANCE_FRACTION = 0.82f
         const val MIN_PATTERN_DISTANCE_PX = 32f
         const val MIN_ACCEPT_SQUARE = 0.62f
