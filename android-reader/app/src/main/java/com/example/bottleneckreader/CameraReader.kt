@@ -5,7 +5,6 @@ import android.hardware.camera2.CaptureRequest
 import android.util.Range
 import android.util.Size
 import androidx.camera.camera2.interop.Camera2Interop
-import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
@@ -29,7 +28,6 @@ class CameraReader(
     private val decoder = LedFrameDecoder()
     private val closed = AtomicBoolean(false)
     private var provider: ProcessCameraProvider? = null
-    private var camera: Camera? = null
     private var analyzer: FrameAnalyzer? = null
 
     fun start() {
@@ -62,7 +60,6 @@ class CameraReader(
         closed.set(true)
         analyzer?.stop()
         provider?.unbindAll()
-        camera = null
         decoder.resetTracking()
     }
 
@@ -112,7 +109,7 @@ class CameraReader(
 
         cameraProvider.unbindAll()
         val viewPort = previewView.viewPort
-        camera = if (viewPort != null) {
+        val boundCamera = if (viewPort != null) {
             cameraProvider.bindToLifecycle(
                 lifecycleOwner,
                 CameraSelector.DEFAULT_BACK_CAMERA,
@@ -130,7 +127,7 @@ class CameraReader(
                 analysis,
             )
         }
-        camera?.cameraInfo?.cameraState?.observe(lifecycleOwner) { state ->
+        boundCamera.cameraInfo.cameraState.observe(lifecycleOwner) { state ->
             val error = state.error ?: return@observe
             eventSink(
                 ReaderEvent.CameraIssue(
@@ -179,7 +176,6 @@ class CameraReader(
                                 cropWidth = image.cropRect.width(),
                                 cropHeight = image.cropRect.height(),
                                 rotationDegrees = image.imageInfo.rotationDegrees,
-                                bits = null,
                                 slots = emptyList(),
                                 debugLines = decoder.lastDebugLines,
                             ),

@@ -9,7 +9,6 @@ data class ImagePoint(
 
 data class LedSlot(
     val imagePoint: ImagePoint,
-    val bitIndex: Int,
     val isFirst: Boolean,
     val imageRadius: Float,
 )
@@ -35,7 +34,6 @@ data class DetectionFrame(
     val cropWidth: Int,
     val cropHeight: Int,
     val rotationDegrees: Int,
-    val bits: String?,
     val ledScores: List<Float> = emptyList(),
     val slots: List<LedSlot>,
     val markers: List<MarkerSlot> = emptyList(),
@@ -43,7 +41,6 @@ data class DetectionFrame(
 )
 
 data class OverlayFrame(
-    val bits: String?,
     val slots: List<OverlaySlot>,
     val markers: List<OverlayMarker>,
 )

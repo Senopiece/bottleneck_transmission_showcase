@@ -22,7 +22,6 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
-import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.widthIn
@@ -520,7 +519,6 @@ private fun DetectionFrame.toOverlay(canvasSize: Size): OverlayFrame {
         canvasSize = canvasSize,
     )
     return OverlayFrame(
-        bits = bits,
         slots = slots.map { slot ->
             OverlaySlot(
                 point = transform.map(
@@ -599,26 +597,18 @@ private data class ImageToPreviewTransform(
         90 -> RotatedPoint(
             x = cropHeight - yInCrop,
             y = xInCrop,
-            width = cropHeight.toFloat(),
-            height = cropWidth.toFloat(),
         )
         180 -> RotatedPoint(
             x = cropWidth - xInCrop,
             y = cropHeight - yInCrop,
-            width = cropWidth.toFloat(),
-            height = cropHeight.toFloat(),
         )
         270 -> RotatedPoint(
             x = yInCrop,
             y = cropWidth - xInCrop,
-            width = cropHeight.toFloat(),
-            height = cropWidth.toFloat(),
         )
         else -> RotatedPoint(
             x = xInCrop,
             y = yInCrop,
-            width = cropWidth.toFloat(),
-            height = cropHeight.toFloat(),
         )
     }
 
@@ -632,6 +622,4 @@ private data class ImageToPreviewTransform(
 private data class RotatedPoint(
     val x: Float,
     val y: Float,
-    val width: Float,
-    val height: Float,
 )

@@ -358,12 +358,10 @@ class LedFrameDecoder {
             cropWidth = reader.cropWidth,
             cropHeight = reader.cropHeight,
             rotationDegrees = reader.rotationDegrees,
-            bits = null,
             ledScores = scores.toList(),
             slots = model.slots.mapIndexed { index, point ->
                 LedSlot(
                     imagePoint = point,
-                    bitIndex = 4 - index,
                     isFirst = index == 0,
                     imageRadius = overlayRadius,
                 )
@@ -418,13 +416,6 @@ class LedFrameDecoder {
         val highlight = ((centerPeak - 150f) / 85f).coerceIn(0f, 1.15f)
         return (lumaContrast * 0.42f + peakContrast * 0.38f + highlight * 0.20f + blue * 0.06f)
             .coerceIn(-0.5f, 1.6f)
-    }
-
-    private fun ledObjectValue(reader: YuvReader, center: ImagePoint, radiusPx: Float): Float {
-        val r = radiusPx.roundToInt().coerceIn(2, 9)
-        val blue = blueObjectValue(reader, center, r)
-        val bright = ((lumaMean(reader, center, r) - 70f) / 130f).coerceIn(0f, 1f)
-        return (blue * 0.62f + bright * 0.38f).coerceIn(0f, 1f)
     }
 
     private fun markerValue(reader: YuvReader, center: ImagePoint, radiusPx: Int): Float {
