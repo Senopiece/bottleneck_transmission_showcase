@@ -68,7 +68,7 @@ class LedFrameDecoder {
     private var previousScore = 0f
     private var missedFrames = 0
     private var debugModeLine = "mode: none"
-    private var debugBitsLine = "bitScore: none"
+    private var debugBitsLine = "ledScore: none"
     private var debugBestScore = BAD_SCORE
     private var debugBestSquare = 0f
     private var debugBestTriangle = 0f
@@ -98,7 +98,7 @@ class LedFrameDecoder {
                 previousTheta = null
                 previousScore = 0f
             }
-            finishDebugFrame("MISS", fit, null)
+            finishDebugFrame("MISS", fit)
             return null
         }
 
@@ -107,7 +107,7 @@ class LedFrameDecoder {
         missedFrames = 0
 
         val frame = decodeWithModel(reader, modelForTheta(fit.theta))
-        val debugLines = finishDebugFrame("HIT", fit, frame.bits)
+        val debugLines = finishDebugFrame("HIT", fit)
         return frame.copy(debugLines = debugLines)
     }
 
@@ -120,16 +120,16 @@ class LedFrameDecoder {
 
     private fun beginDebugFrame() {
         debugModeLine = "mode: none"
-        debugBitsLine = "bitScore: none"
+        debugBitsLine = "ledScore: none"
         debugBestScore = BAD_SCORE
         debugBestSquare = 0f
         debugBestTriangle = 0f
         debugBestDistanceInRoi = 0f
     }
 
-    private fun finishDebugFrame(status: String, fit: Fit?, bits: String?): List<String> {
+    private fun finishDebugFrame(status: String, fit: Fit?): List<String> {
         val lines = ArrayList<String>(7)
-        lines.add("$status bits=${bits ?: "null"}")
+        lines.add(status)
         lines.add(debugModeLine)
         if (fit != null) {
             lines.add("fit score=${fmt(fit.score)} d=${fmt(fit.theta.distance)} angle=${fmt(fit.theta.angle)}")
@@ -347,7 +347,7 @@ class LedFrameDecoder {
     }
 
     private fun decodeWithModel(reader: YuvReader, model: PatternModel): DetectionFrame {
-        val rawBits = decodeBits(reader, model)
+        val scores = readLedScores(reader, model)
         val overlayRadius = (model.ledRadiusPx * 1.25f).coerceIn(3.5f, 13f)
         return DetectionFrame(
             timestampNs = reader.timestampNs,
@@ -358,7 +358,8 @@ class LedFrameDecoder {
             cropWidth = reader.cropWidth,
             cropHeight = reader.cropHeight,
             rotationDegrees = reader.rotationDegrees,
-            bits = rawBits,
+            bits = null,
+            ledScores = scores.toList(),
             slots = model.slots.mapIndexed { index, point ->
                 LedSlot(
                     imagePoint = point,
@@ -387,21 +388,16 @@ class LedFrameDecoder {
         )
     }
 
-    private fun decodeBits(reader: YuvReader, model: PatternModel): String {
+    private fun readLedScores(reader: YuvReader, model: PatternModel): FloatArray {
         val scores = FloatArray(model.slots.size)
         for (index in model.slots.indices) {
             scores[index] = ledOnScore(reader, model.slots[index], model.ledRadiusPx, model)
         }
         debugBitsLine = buildString {
-            append("bitScore")
+            append("ledScore")
             scores.forEach { append(' ').append(fmt(it)) }
-            append(" th=").append(fmt(BIT_ABSOLUTE_ON_THRESHOLD))
         }
-        return buildString(capacity = scores.size) {
-            for (score in scores) {
-                append(if (score > BIT_ABSOLUTE_ON_THRESHOLD) '1' else '0')
-            }
-        }
+        return scores
     }
 
     private fun ledOnScore(reader: YuvReader, center: ImagePoint, radiusPx: Float, model: PatternModel): Float {
@@ -662,7 +658,6 @@ class LedFrameDecoder {
         const val MIN_ACCEPT_SCORE = 6.0f
         const val INITIAL_PATTERN_DISTANCE_FRACTION = 0.82f
         const val MIN_PATTERN_DISTANCE_PX = 32f
-        const val BIT_ABSOLUTE_ON_THRESHOLD = 0.62f
         const val MIN_ACCEPT_SQUARE = 0.62f
         const val MIN_ACCEPT_TRIANGLE = 0.38f
         const val BAD_SCORE = -1_000_000f

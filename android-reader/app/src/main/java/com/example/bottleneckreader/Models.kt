@@ -36,6 +36,7 @@ data class DetectionFrame(
     val cropHeight: Int,
     val rotationDegrees: Int,
     val bits: String?,
+    val ledScores: List<Float> = emptyList(),
     val slots: List<LedSlot>,
     val markers: List<MarkerSlot> = emptyList(),
     val debugLines: List<String> = emptyList(),
@@ -64,6 +65,17 @@ data class ReaderNotice(
     val id: Long,
     val message: String,
     val exiting: Boolean = false,
+)
+
+data class PacketEvent(
+    val id: Long,
+    val timestampNs: Long,
+    val bits: String?,
+)
+
+data class LedScoreSample(
+    val timestampNs: Long,
+    val scores: List<Float>?,
 )
 
 data class CameraProblem(
