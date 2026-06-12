@@ -1,5 +1,6 @@
 package com.example.bottleneckreader
 
+import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.delay
@@ -8,12 +9,14 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import java.util.Locale
 import java.util.concurrent.atomic.AtomicLong
 
 class ReaderViewModel : ViewModel() {
     private val ids = AtomicLong(0)
     private val packetIds = AtomicLong(0)
     private val debouncer = LedDebouncer()
+    private var csvHeaderLogged = false
 
     private val _frame = MutableStateFlow<DetectionFrame?>(null)
     val frame: StateFlow<DetectionFrame?> = _frame.asStateFlow()
@@ -23,9 +26,6 @@ class ReaderViewModel : ViewModel() {
 
     private val _packetEvents = MutableStateFlow<List<PacketEvent>>(emptyList())
     val packetEvents: StateFlow<List<PacketEvent>> = _packetEvents.asStateFlow()
-
-    private val _scoreHistory = MutableStateFlow<List<LedScoreSample>>(emptyList())
-    val scoreHistory: StateFlow<List<LedScoreSample>> = _scoreHistory.asStateFlow()
 
     private val _problem = MutableStateFlow<CameraProblem?>(null)
     val problem: StateFlow<CameraProblem?> = _problem.asStateFlow()
@@ -93,20 +93,17 @@ class ReaderViewModel : ViewModel() {
     private fun onDetection(frame: DetectionFrame) {
         _frame.value = frame
         val scores = frame.ledScores.takeIf { it.size == LED_COUNT }
-        appendScoreSample(
-            LedScoreSample(
-                timestampNs = frame.timestampNs,
-                scores = scores,
-            ),
-        )
-        debouncer.accept(scores)?.let { result ->
+        val event = debouncer.accept(scores)
+        logScoreCsv(frame.timestampNs, scores, event)
+        event?.let { result ->
             appendPacketEvent(frame.timestampNs, result.bits)
         }
     }
 
     private fun resetDebouncer(timestampNs: Long) {
-        appendScoreSample(LedScoreSample(timestampNs = timestampNs, scores = null))
-        debouncer.reset()?.let { result ->
+        val event = debouncer.reset()
+        logScoreCsv(timestampNs, null, event)
+        event?.let { result ->
             appendPacketEvent(timestampNs, result.bits)
         }
     }
@@ -120,14 +117,35 @@ class ReaderViewModel : ViewModel() {
         _packetEvents.update { events -> (listOf(event) + events).take(MAX_PACKET_EVENTS) }
     }
 
-    private fun appendScoreSample(sample: LedScoreSample) {
-        _scoreHistory.update { samples -> (samples + sample).takeLast(MAX_SCORE_SAMPLES) }
+    private fun logScoreCsv(
+        timestampNs: Long,
+        scores: List<Float>?,
+        event: LedDebouncer.Result?,
+    ) {
+        if (!csvHeaderLogged) {
+            Log.d(SCORE_CSV_TAG, "timestampNs,detected,s0,s1,s2,s3,s4,event")
+            csvHeaderLogged = true
+        }
+        val eventValue = when {
+            event == null -> ""
+            event.bits == null -> "null"
+            else -> event.bits
+        }
+        val scoreColumns = if (scores == null) {
+            ",,,,"
+        } else {
+            scores.joinToString(separator = ",") { String.format(Locale.US, "%.4f", it) }
+        }
+        Log.d(
+            SCORE_CSV_TAG,
+            "$timestampNs,${if (scores == null) 0 else 1},$scoreColumns,$eventValue",
+        )
     }
 
     private companion object {
         const val LED_COUNT = 5
         const val MAX_PACKET_EVENTS = 3
-        const val MAX_SCORE_SAMPLES = 120
+        const val SCORE_CSV_TAG = "LedScoresCsv"
         const val NOTICE_VISIBLE_MS = 3_200L
         const val NOTICE_EXIT_MS = 420L
     }

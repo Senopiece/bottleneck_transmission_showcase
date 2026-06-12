@@ -73,11 +73,6 @@ data class PacketEvent(
     val bits: String?,
 )
 
-data class LedScoreSample(
-    val timestampNs: Long,
-    val scores: List<Float>?,
-)
-
 data class CameraProblem(
     val title: String,
     val message: String,

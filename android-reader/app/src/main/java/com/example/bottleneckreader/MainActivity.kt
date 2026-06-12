@@ -24,8 +24,6 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -131,7 +129,6 @@ private fun ReaderApp(viewModel: ReaderViewModel = viewModel()) {
     val frame by viewModel.frame.collectAsStateWithLifecycle()
     val notices by viewModel.notices.collectAsStateWithLifecycle()
     val packetEvents by viewModel.packetEvents.collectAsStateWithLifecycle()
-    val scoreHistory by viewModel.scoreHistory.collectAsStateWithLifecycle()
     val problem by viewModel.problem.collectAsStateWithLifecycle()
     val restartToken by viewModel.restartToken.collectAsStateWithLifecycle()
 
@@ -150,16 +147,6 @@ private fun ReaderApp(viewModel: ReaderViewModel = viewModel()) {
         )
 
         PacketEventsBelowRoi(events = packetEvents)
-
-        LedScoreGraph(
-            history = scoreHistory,
-            modifier = Modifier
-                .align(Alignment.BottomCenter)
-                .padding(bottom = 18.dp)
-                .fillMaxWidth(0.88f)
-                .widthIn(max = 420.dp)
-                .height(96.dp),
-        )
 
         DebugPanel(
             lines = frame?.debugLines.orEmpty(),
@@ -461,98 +448,6 @@ private object AcquireGuideGeometry {
         (firstLedOffsetMm + index * stepMm) / markerDistanceMm
     }
 }
-
-@Composable
-private fun LedScoreGraph(
-    history: List<LedScoreSample>,
-    modifier: Modifier = Modifier,
-) {
-    Canvas(
-        modifier = modifier.background(Color(0xA8000000), RoundedCornerShape(6.dp)),
-    ) {
-        val samples = history.takeLast(SCORE_GRAPH_SAMPLES)
-        if (samples.size < 2) return@Canvas
-
-        val left = 8.dp.toPx()
-        val right = size.width - 8.dp.toPx()
-        val top = 8.dp.toPx()
-        val bottom = size.height - 8.dp.toPx()
-        val width = (right - left).coerceAtLeast(1f)
-        val height = (bottom - top).coerceAtLeast(1f)
-
-        fun xAt(index: Int): Float = left + width * index / (samples.size - 1).coerceAtLeast(1)
-        fun yAt(score: Float): Float {
-            val normalized = (score / SCORE_GRAPH_MAX).coerceIn(0f, 1f)
-            return bottom - height * normalized
-        }
-
-        drawLine(
-            color = Color(0x55E8EAEE),
-            start = Offset(left, yAt(LED_ON_THRESHOLD)),
-            end = Offset(right, yAt(LED_ON_THRESHOLD)),
-            strokeWidth = 1.dp.toPx(),
-        )
-        drawLine(
-            color = Color(0x33E8EAEE),
-            start = Offset(left, yAt(LED_OFF_THRESHOLD)),
-            end = Offset(right, yAt(LED_OFF_THRESHOLD)),
-            strokeWidth = 1.dp.toPx(),
-        )
-
-        samples.forEachIndexed { index, sample ->
-            if (sample.scores == null) {
-                val x = xAt(index)
-                drawLine(
-                    color = Color(0x55E8EAEE),
-                    start = Offset(x, top),
-                    end = Offset(x, bottom),
-                    strokeWidth = 1.dp.toPx(),
-                )
-            }
-        }
-
-        LED_GRAPH_COLORS.forEachIndexed { ledIndex, color ->
-            val path = Path()
-            var hasOpenPath = false
-            var hasAnyPoint = false
-            samples.forEachIndexed { index, sample ->
-                val score = sample.scores?.getOrNull(ledIndex)
-                if (score == null) {
-                    hasOpenPath = false
-                    return@forEachIndexed
-                }
-                val point = Offset(xAt(index), yAt(score))
-                if (!hasOpenPath) {
-                    path.moveTo(point.x, point.y)
-                    hasOpenPath = true
-                } else {
-                    path.lineTo(point.x, point.y)
-                }
-                hasAnyPoint = true
-            }
-            if (hasAnyPoint) {
-                drawPath(
-                    path = path,
-                    color = color,
-                    style = Stroke(width = 1.6.dp.toPx()),
-                )
-            }
-        }
-    }
-}
-
-private val LED_GRAPH_COLORS = listOf(
-    Color(0xFF55A7FF),
-    Color(0xFF65D6A4),
-    Color(0xFFFFD166),
-    Color(0xFFFF7A90),
-    Color(0xFFC99CFF),
-)
-
-private const val SCORE_GRAPH_SAMPLES = 90
-private const val SCORE_GRAPH_MAX = 1.4f
-private const val LED_ON_THRESHOLD = 0.72f
-private const val LED_OFF_THRESHOLD = 0.48f
 
 @Composable
 private fun DecodedBadge(
