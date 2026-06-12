@@ -177,6 +177,7 @@ class CameraReader(
                                 cropHeight = image.cropRect.height(),
                                 rotationDegrees = image.imageInfo.rotationDegrees,
                                 slots = emptyList(),
+                                isAcquireMode = decoder.isAcquireMode,
                                 debugLines = decoder.lastDebugLines,
                             ),
                         ),
@@ -197,8 +198,12 @@ class CameraReader(
                 image.close()
             }
 
-            val elapsedMs = (System.nanoTime() - started) / 1_000_000
-            updateWatchdog(elapsedMs)
+            val elapsedNs = System.nanoTime() - started
+            val elapsedMs = elapsedNs / 1_000_000f
+            if (BuildConfig.LED_DIAGNOSTICS) {
+                eventSink(ReaderEvent.DecoderTiming(elapsedMs))
+            }
+            updateWatchdog((elapsedNs / 1_000_000).coerceAtLeast(0))
         }
 
         private fun updateWatchdog(elapsedMs: Long) {

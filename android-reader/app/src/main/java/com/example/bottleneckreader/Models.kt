@@ -37,6 +37,7 @@ data class DetectionFrame(
     val ledScores: FloatArray = FloatArray(0),
     val slots: List<LedSlot>,
     val markers: List<MarkerSlot> = emptyList(),
+    val isAcquireMode: Boolean = false,
     val debugLines: List<String> = emptyList(),
 )
 
@@ -70,6 +71,13 @@ data class PacketEvent(
     val bits: String?,
 )
 
+data class DecoderTimingWindow(
+    val samplesMs: List<Float> = emptyList(),
+    val avgMs: Float = 0f,
+    val minMs: Float = 0f,
+    val maxMs: Float = 0f,
+)
+
 data class CameraProblem(
     val title: String,
     val message: String,
@@ -77,6 +85,7 @@ data class CameraProblem(
 
 sealed interface ReaderEvent {
     data class Detection(val frame: DetectionFrame) : ReaderEvent
+    data class DecoderTiming(val elapsedMs: Float) : ReaderEvent
     data class Notice(val message: String) : ReaderEvent
     data class CameraIssue(val problem: CameraProblem) : ReaderEvent
     data object SlowDecoderTerminated : ReaderEvent

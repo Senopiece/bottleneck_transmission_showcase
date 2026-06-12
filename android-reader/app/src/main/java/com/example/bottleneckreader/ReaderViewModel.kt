@@ -27,6 +27,9 @@ class ReaderViewModel : ViewModel() {
     private val _packetEvents = MutableStateFlow<List<PacketEvent>>(emptyList())
     val packetEvents: StateFlow<List<PacketEvent>> = _packetEvents.asStateFlow()
 
+    private val _decoderTiming = MutableStateFlow(DecoderTimingWindow())
+    val decoderTiming: StateFlow<DecoderTimingWindow> = _decoderTiming.asStateFlow()
+
     private val _problem = MutableStateFlow<CameraProblem?>(null)
     val problem: StateFlow<CameraProblem?> = _problem.asStateFlow()
 
@@ -36,6 +39,7 @@ class ReaderViewModel : ViewModel() {
     fun onReaderEvent(event: ReaderEvent) {
         when (event) {
             is ReaderEvent.Detection -> onDetection(event.frame)
+            is ReaderEvent.DecoderTiming -> onDecoderTiming(event.elapsedMs)
             is ReaderEvent.Notice -> enqueueNotice(event.message)
             is ReaderEvent.CameraIssue -> {
                 _problem.value = event.problem
@@ -117,11 +121,33 @@ class ReaderViewModel : ViewModel() {
         _packetEvents.update { events -> (listOf(event) + events).take(MAX_PACKET_EVENTS) }
     }
 
+    private fun onDecoderTiming(elapsedMs: Float) {
+        if (!BuildConfig.LED_DIAGNOSTICS) return
+        _decoderTiming.update { current ->
+            val samples = (current.samplesMs + elapsedMs).takeLast(TIMING_WINDOW_SIZE)
+            var min = Float.POSITIVE_INFINITY
+            var max = Float.NEGATIVE_INFINITY
+            var sum = 0f
+            for (sample in samples) {
+                if (sample < min) min = sample
+                if (sample > max) max = sample
+                sum += sample
+            }
+            DecoderTimingWindow(
+                samplesMs = samples,
+                avgMs = if (samples.isEmpty()) 0f else sum / samples.size,
+                minMs = if (samples.isEmpty()) 0f else min,
+                maxMs = if (samples.isEmpty()) 0f else max,
+            )
+        }
+    }
+
     private fun logScoreCsv(
         timestampNs: Long,
         scores: FloatArray?,
         event: LedDebouncer.Result?,
     ) {
+        if (!BuildConfig.LED_DIAGNOSTICS) return
         if (!csvHeaderLogged) {
             Log.d(SCORE_CSV_TAG, "timestampNs,detected,s0,s1,s2,s3,s4,event")
             csvHeaderLogged = true
@@ -145,6 +171,7 @@ class ReaderViewModel : ViewModel() {
     private companion object {
         const val LED_COUNT = 5
         const val MAX_PACKET_EVENTS = 3
+        const val TIMING_WINDOW_SIZE = 90
         const val SCORE_CSV_TAG = "LedScoresCsv"
         const val NOTICE_VISIBLE_MS = 3_200L
         const val NOTICE_EXIT_MS = 420L

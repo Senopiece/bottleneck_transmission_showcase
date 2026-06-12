@@ -63,6 +63,8 @@ class LedFrameDecoder {
 
     var lastDebugLines: List<String> = emptyList()
         private set
+    var isAcquireMode: Boolean = true
+        private set
 
     private var previousTheta: Theta? = null
     private var previousScore = 0f
@@ -81,15 +83,21 @@ class LedFrameDecoder {
 
         val seed = initialTheta(reader, roi)
         val tracking = previousTheta != null && missedFrames <= TRACKING_CONTINUITY_MISSES
-        debugModeLine = if (tracking) {
-            "mode: tracking prevScore=${fmt(previousScore)} missed=$missedFrames"
-        } else {
-            "mode: acquire centered"
+        isAcquireMode = !tracking
+        if (BuildConfig.LED_DIAGNOSTICS) {
+            debugModeLine = if (tracking) {
+                "mode: tracking prevScore=${fmt(previousScore)} missed=$missedFrames"
+            } else {
+                "mode: acquire centered"
+            }
         }
 
         var fit = refine(reader, roi, seed, if (tracking) TRACKING_STEPS else ACQUIRE_STEPS)
         if (tracking && !isAccepted(fit)) {
-            debugModeLine = "mode: tracking fallback prevScore=${fmt(previousScore)} missed=$missedFrames"
+            isAcquireMode = true
+            if (BuildConfig.LED_DIAGNOSTICS) {
+                debugModeLine = "mode: tracking fallback prevScore=${fmt(previousScore)} missed=$missedFrames"
+            }
             fit = refine(reader, roi, centeredTheta(reader, roi), ACQUIRE_STEPS)
         }
         if (!isAccepted(fit)) {
@@ -117,9 +125,11 @@ class LedFrameDecoder {
         previousScore = 0f
         missedFrames = 0
         lastDebugLines = emptyList()
+        isAcquireMode = true
     }
 
     private fun beginDebugFrame() {
+        if (!BuildConfig.LED_DIAGNOSTICS) return
         debugModeLine = "mode: none"
         debugBitsLine = "ledScore: none"
         debugBestScore = BAD_SCORE
@@ -129,6 +139,10 @@ class LedFrameDecoder {
     }
 
     private fun finishDebugFrame(status: String, fit: Fit?): List<String> {
+        if (!BuildConfig.LED_DIAGNOSTICS) {
+            lastDebugLines = emptyList()
+            return emptyList()
+        }
         val lines = ArrayList<String>(7)
         lines.add(status)
         lines.add(debugModeLine)
@@ -253,7 +267,7 @@ class LedFrameDecoder {
         val score = square * 2.95f +
             triangle * 4.35f
 
-        if (score > debugBestScore) {
+        if (BuildConfig.LED_DIAGNOSTICS && score > debugBestScore) {
             debugBestScore = score
             debugBestSquare = square
             debugBestTriangle = triangle
@@ -388,6 +402,7 @@ class LedFrameDecoder {
                     imageSize = model.triangleSizePx,
                 ),
             ),
+            isAcquireMode = isAcquireMode,
             debugLines = debugLines,
         )
     }
@@ -397,9 +412,11 @@ class LedFrameDecoder {
         for (index in model.slots.indices) {
             scores[index] = ledOnScore(reader, model.slots[index], model.ledRadiusPx, model)
         }
-        debugBitsLine = buildString {
-            append("ledScore")
-            scores.forEach { append(' ').append(fmt(it)) }
+        if (BuildConfig.LED_DIAGNOSTICS) {
+            debugBitsLine = buildString {
+                append("ledScore")
+                scores.forEach { append(' ').append(fmt(it)) }
+            }
         }
         return scores
     }

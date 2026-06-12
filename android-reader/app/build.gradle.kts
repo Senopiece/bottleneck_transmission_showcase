@@ -17,7 +17,17 @@ android {
     }
 
     buildFeatures {
+        buildConfig = true
         compose = true
+    }
+
+    buildTypes {
+        debug {
+            buildConfigField("boolean", "LED_DIAGNOSTICS", "true")
+        }
+        release {
+            buildConfigField("boolean", "LED_DIAGNOSTICS", "false")
+        }
     }
 
     compileOptions {
