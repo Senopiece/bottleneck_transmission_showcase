@@ -46,6 +46,7 @@ class PacketClockDecoder {
     private var nextEmitAtNs = 0L
     private var bitStates: BooleanArray? = null
     private val symbolScoreSums = FloatArray(BIT_COUNT)
+    private val symbolScoreMax = FloatArray(BIT_COUNT)
     private var symbolSampleCount = 0
 
     fun accept(timestampNs: Long, scores: FloatArray?): Result? {
@@ -164,7 +165,11 @@ class PacketClockDecoder {
         if (phaseInSymbol < SYMBOL_SAMPLE_START || phaseInSymbol > SYMBOL_SAMPLE_END) return
 
         for (index in 0 until BIT_COUNT) {
-            symbolScoreSums[index] += scores[index]
+            val score = scores[index]
+            symbolScoreSums[index] += score
+            if (score > symbolScoreMax[index]) {
+                symbolScoreMax[index] = score
+            }
         }
         symbolSampleCount += 1
     }
@@ -173,13 +178,22 @@ class PacketClockDecoder {
         return buildString(BIT_COUNT) {
             for (index in 0 until BIT_COUNT) {
                 val average = symbolScoreSums[index] / symbolSampleCount
-                append(if (average >= SYMBOL_ON_THRESHOLD) '1' else '0')
+                val peak = symbolScoreMax[index]
+                append(
+                    when {
+                        average >= SYMBOL_ON_THRESHOLD -> '1'
+                        peak >= SYMBOL_STRONG_ON_THRESHOLD && average >= SYMBOL_WEAK_ON_AVERAGE -> '1'
+                        average <= SYMBOL_OFF_THRESHOLD && peak <= SYMBOL_OFF_PEAK_LIMIT -> '0'
+                        else -> '?'
+                    },
+                )
             }
         }
     }
 
     private fun clearSymbolSamples() {
         java.util.Arrays.fill(symbolScoreSums, 0f)
+        java.util.Arrays.fill(symbolScoreMax, Float.NEGATIVE_INFINITY)
         symbolSampleCount = 0
     }
 
@@ -246,9 +260,13 @@ class PacketClockDecoder {
         val PREAMBLE = arrayOf("00000", "01010", "10101", "11111")
         const val ON_THRESHOLD = 1.0f
         const val OFF_THRESHOLD = 0.6f
-        const val SYMBOL_ON_THRESHOLD = 0.82f
-        const val SYMBOL_SAMPLE_START = 0.30f
-        const val SYMBOL_SAMPLE_END = 0.78f
+        const val SYMBOL_ON_THRESHOLD = 0.94f
+        const val SYMBOL_STRONG_ON_THRESHOLD = 1.12f
+        const val SYMBOL_WEAK_ON_AVERAGE = 0.72f
+        const val SYMBOL_OFF_THRESHOLD = 0.56f
+        const val SYMBOL_OFF_PEAK_LIMIT = 0.86f
+        const val SYMBOL_SAMPLE_START = 0.22f
+        const val SYMBOL_SAMPLE_END = 0.82f
         const val DEFAULT_PERIOD_NS = 125_000_000L
         const val MIN_PERIOD_NS = 33_000_000L
         const val MAX_PERIOD_NS = 1_000_000_000L
