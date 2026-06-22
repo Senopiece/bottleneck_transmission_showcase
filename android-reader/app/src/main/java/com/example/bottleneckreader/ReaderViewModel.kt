@@ -13,8 +13,10 @@ import java.util.concurrent.atomic.AtomicLong
 class ReaderViewModel : ViewModel() {
     private val ids = AtomicLong(0)
     private val packetIds = AtomicLong(0)
-    private val debouncer = LedDebouncer()
+    private val messageIds = AtomicLong(0)
+    private val packetDecoder = PacketClockDecoder()
     private val scoreLogger = ScoreLogger()
+    private val messagePackets = ArrayList<String>(MESSAGE_PACKET_COUNT)
 
     private val _frame = MutableStateFlow<DetectionFrame?>(null)
     val frame: StateFlow<DetectionFrame?> = _frame.asStateFlow()
@@ -24,6 +26,9 @@ class ReaderViewModel : ViewModel() {
 
     private val _packetEvents = MutableStateFlow<List<PacketEvent>>(emptyList())
     val packetEvents: StateFlow<List<PacketEvent>> = _packetEvents.asStateFlow()
+
+    private val _decodedMessage = MutableStateFlow<DecodedMessage?>(null)
+    val decodedMessage: StateFlow<DecodedMessage?> = _decodedMessage.asStateFlow()
 
     private val _decoderTiming = MutableStateFlow(DecoderTimingWindow())
     val decoderTiming: StateFlow<DecoderTimingWindow> = _decoderTiming.asStateFlow()
@@ -42,7 +47,7 @@ class ReaderViewModel : ViewModel() {
             is ReaderEvent.CameraIssue -> {
                 _problem.value = event.problem
                 enqueueNotice(event.problem.title)
-                resetDebouncer(System.nanoTime())
+                resetPacketDecoder(System.nanoTime())
             }
             ReaderEvent.SlowDecoderTerminated -> {
                 val problem = CameraProblem(
@@ -51,7 +56,7 @@ class ReaderViewModel : ViewModel() {
                 )
                 _problem.value = problem
                 enqueueNotice("Stream terminated: decoder too slow")
-                resetDebouncer(System.nanoTime())
+                resetPacketDecoder(System.nanoTime())
             }
         }
     }
@@ -66,7 +71,7 @@ class ReaderViewModel : ViewModel() {
     }
 
     fun markStreamInterrupted() {
-        resetDebouncer(System.nanoTime())
+        resetPacketDecoder(System.nanoTime())
     }
 
     fun retryCamera() {
@@ -95,22 +100,40 @@ class ReaderViewModel : ViewModel() {
     private fun onDetection(frame: DetectionFrame) {
         _frame.value = frame
         val scores = frame.ledScores.takeIf { it.size == LED_COUNT }
-        val event = debouncer.accept(scores)
+        val event = packetDecoder.accept(frame.timestampNs, scores)
         if (Diagnostics.enabled) {
-            scoreLogger.log(frame.timestampNs, scores, event)
+            scoreLogger.log(frame.timestampNs, scores, event, packetDecoder.debugState)
         }
         event?.let { result ->
-            appendPacketEvent(frame.timestampNs, result.bits)
+            onPacketEvent(frame.timestampNs, result.bits)
         }
     }
 
-    private fun resetDebouncer(timestampNs: Long) {
-        val event = debouncer.reset()
+    private fun resetPacketDecoder(timestampNs: Long) {
+        val event = packetDecoder.reset()
         if (Diagnostics.enabled) {
-            scoreLogger.log(timestampNs, null, event)
+            scoreLogger.log(timestampNs, null, event, packetDecoder.debugState)
         }
         event?.let { result ->
-            appendPacketEvent(timestampNs, result.bits)
+            onPacketEvent(timestampNs, result.bits)
+        }
+    }
+
+    private fun onPacketEvent(timestampNs: Long, bits: String?) {
+        appendPacketEvent(timestampNs, bits)
+        if (bits == null) {
+            messagePackets.clear()
+            return
+        }
+        if (messagePackets.size >= MESSAGE_PACKET_COUNT) return
+        if (messagePackets.isEmpty()) {
+            _decodedMessage.value = null
+        }
+        messagePackets += bits
+        if (messagePackets.size == MESSAGE_PACKET_COUNT) {
+            decodeMessage()
+            messagePackets.clear()
+            packetDecoder.finishMessage()
         }
     }
 
@@ -121,6 +144,71 @@ class ReaderViewModel : ViewModel() {
             bits = bits,
         )
         _packetEvents.update { events -> (listOf(event) + events).take(MAX_PACKET_EVENTS) }
+    }
+
+    private fun decodeMessage() {
+        val codeword = messagePackets.joinToString(separator = "")
+        if (codeword.length < CODEWORD_BITS) return
+        val decoded = decodeSparseParityCodeword(codeword) ?: return
+        val pixels = BooleanArray(MESSAGE_BITS) { index -> decoded[index] }
+        _decodedMessage.value = DecodedMessage(
+            id = messageIds.incrementAndGet(),
+            bits = pixels,
+        )
+    }
+
+    private fun decodeSparseParityCodeword(codeword: String): BooleanArray? {
+        val bits = BooleanArray(CODEWORD_BITS) { index -> codeword[index] == '1' }
+        val votes = IntArray(CODEWORD_BITS)
+
+        repeat(LDPC_MAX_ITERATIONS) {
+            var missCount = 0
+            java.util.Arrays.fill(votes, 0)
+
+            for (check in 0 until PARITY_BITS) {
+                var parity = bits[MESSAGE_BITS + check]
+                val group = LDPC_GROUPS[check]
+                for (dataIndex in group) {
+                    parity = parity != bits[dataIndex]
+                }
+                if (parity) {
+                    missCount += 1
+                    votes[MESSAGE_BITS + check] += 1
+                    for (dataIndex in group) {
+                        votes[dataIndex] += 1
+                    }
+                }
+            }
+
+            if (missCount == 0) return bits
+
+            var bestIndex = -1
+            var bestVotes = 0
+            for (index in votes.indices) {
+                if (votes[index] > bestVotes) {
+                    bestVotes = votes[index]
+                    bestIndex = index
+                }
+            }
+
+            if (bestVotes < MIN_BIT_FLIP_VOTES || bestIndex < 0) return null
+            bits[bestIndex] = !bits[bestIndex]
+        }
+
+        return if (parityMissCount(bits) == 0) bits else null
+    }
+
+    private fun parityMissCount(bits: BooleanArray): Int {
+        var missCount = 0
+        for (check in 0 until PARITY_BITS) {
+            var parity = bits[MESSAGE_BITS + check]
+            val group = LDPC_GROUPS[check]
+            for (dataIndex in group) {
+                parity = parity != bits[dataIndex]
+            }
+            if (parity) missCount += 1
+        }
+        return missCount
     }
 
     private fun onDecoderTiming(elapsedMs: Float) {
@@ -147,8 +235,23 @@ class ReaderViewModel : ViewModel() {
     private companion object {
         const val LED_COUNT = 5
         const val MAX_PACKET_EVENTS = 3
+        const val MESSAGE_BITS = 36
+        const val PARITY_BITS = 24
+        const val CODEWORD_BITS = MESSAGE_BITS + PARITY_BITS
+        const val MESSAGE_PACKET_COUNT = CODEWORD_BITS / LED_COUNT
+        const val LDPC_MAX_ITERATIONS = 8
+        const val MIN_BIT_FLIP_VOTES = 2
         const val TIMING_WINDOW_SIZE = 90
         const val NOTICE_VISIBLE_MS = 3_200L
         const val NOTICE_EXIT_MS = 420L
+
+        val LDPC_GROUPS: Array<IntArray> = Array(PARITY_BITS) { index ->
+            intArrayOf(
+                (index * 5) % MESSAGE_BITS,
+                (index * 5 + 7) % MESSAGE_BITS,
+                (index * 5 + 13) % MESSAGE_BITS,
+                (index * 5 + 23) % MESSAGE_BITS,
+            )
+        }
     }
 }

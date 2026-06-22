@@ -92,15 +92,27 @@ class LedFrameDecoder {
             }
         }
 
-        var fit = refine(reader, searchArea, seed, if (tracking) TRACKING_STEPS else ACQUIRE_STEPS)
-        if (tracking && !isAccepted(fit)) {
+        var fit = refine(
+            reader = reader,
+            searchArea = searchArea,
+            seed = seed,
+            steps = if (tracking) TRACKING_STEPS else ACQUIRE_STEPS,
+            trackingAcceptance = tracking,
+        )
+        if (tracking && !isAccepted(fit, tracking = true)) {
             isAcquireMode = true
             if (Diagnostics.enabled) {
                 debugModeLine = "mode: tracking fallback prevScore=${fmt(previousScore)} missed=$missedFrames"
             }
-            fit = refine(reader, searchArea, centeredTheta(reader, searchArea), ACQUIRE_STEPS)
+            fit = refine(
+                reader = reader,
+                searchArea = searchArea,
+                seed = centeredTheta(reader, searchArea),
+                steps = ACQUIRE_STEPS,
+                trackingAcceptance = false,
+            )
         }
-        if (!isAccepted(fit)) {
+        if (!isAccepted(fit, tracking = !isAcquireMode)) {
             missedFrames++
             if (missedFrames >= RESET_AFTER_MISSES) {
                 previousTheta = null
@@ -187,7 +199,13 @@ class LedFrameDecoder {
         )
     }
 
-    private fun refine(reader: YuvReader, searchArea: RotatedSearchArea, seed: Theta, steps: Array<Step>): Fit {
+    private fun refine(
+        reader: YuvReader,
+        searchArea: RotatedSearchArea,
+        seed: Theta,
+        steps: Array<Step>,
+        trackingAcceptance: Boolean,
+    ): Fit {
         val guideWidth = reader.guideWidth()
         val minLogDistance = ln(max(MIN_PATTERN_DISTANCE_PX, guideWidth * 0.58f))
         val maxLogDistance = ln(guideWidth * 1.02f)
@@ -232,7 +250,7 @@ class LedFrameDecoder {
                 bestTheta = theta
                 bestBreakdown = breakdown
             }
-            if (!improved && isAccepted(bestBreakdown, bestScore)) break
+            if (!improved && isAccepted(bestBreakdown, bestScore, tracking = trackingAcceptance)) break
         }
 
         return Fit(bestTheta, bestBreakdown)
@@ -245,14 +263,17 @@ class LedFrameDecoder {
         )
     }
 
-    private fun isAccepted(fit: Fit): Boolean {
-        return isAccepted(fit.breakdown, fit.score)
+    private fun isAccepted(fit: Fit, tracking: Boolean): Boolean {
+        return isAccepted(fit.breakdown, fit.score, tracking)
     }
 
-    private fun isAccepted(parts: ScoreBreakdown, score: Float): Boolean {
-        if (score < MIN_ACCEPT_SCORE) return false
-        return parts.square >= MIN_ACCEPT_SQUARE &&
-            parts.triangle >= MIN_ACCEPT_TRIANGLE
+    private fun isAccepted(parts: ScoreBreakdown, score: Float, tracking: Boolean): Boolean {
+        val minScore = if (tracking) MIN_TRACKING_ACCEPT_SCORE else MIN_ACQUIRE_ACCEPT_SCORE
+        val minSquare = if (tracking) MIN_TRACKING_ACCEPT_SQUARE else MIN_ACQUIRE_ACCEPT_SQUARE
+        val minTriangle = if (tracking) MIN_TRACKING_ACCEPT_TRIANGLE else MIN_ACQUIRE_ACCEPT_TRIANGLE
+        if (score < minScore) return false
+        return parts.square >= minSquare &&
+            parts.triangle >= minTriangle
     }
 
     private fun scoreBreakdown(reader: YuvReader, searchArea: RotatedSearchArea, theta: Theta): ScoreBreakdown {
@@ -692,11 +713,14 @@ class LedFrameDecoder {
     private companion object {
         const val RESET_AFTER_MISSES = 4
         const val TRACKING_CONTINUITY_MISSES = 1
-        const val MIN_ACCEPT_SCORE = 4.0f
+        const val MIN_TRACKING_ACCEPT_SCORE = 4.0f
+        const val MIN_ACQUIRE_ACCEPT_SCORE = 4.75f
         const val INITIAL_PATTERN_DISTANCE_FRACTION = 0.82f
         const val MIN_PATTERN_DISTANCE_PX = 32f
-        const val MIN_ACCEPT_SQUARE = 0.62f
-        const val MIN_ACCEPT_TRIANGLE = 0.38f
+        const val MIN_TRACKING_ACCEPT_SQUARE = 0.62f
+        const val MIN_TRACKING_ACCEPT_TRIANGLE = 0.38f
+        const val MIN_ACQUIRE_ACCEPT_SQUARE = 0.72f
+        const val MIN_ACQUIRE_ACCEPT_TRIANGLE = 0.52f
         const val BAD_SCORE = -1_000_000f
 
         val ACQUIRE_STEPS = arrayOf(

@@ -23,7 +23,9 @@ import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
@@ -128,6 +130,7 @@ private fun ReaderApp(viewModel: ReaderViewModel = viewModel()) {
     val frame by viewModel.frame.collectAsStateWithLifecycle()
     val notices by viewModel.notices.collectAsStateWithLifecycle()
     val packetEvents by viewModel.packetEvents.collectAsStateWithLifecycle()
+    val decodedMessage by viewModel.decodedMessage.collectAsStateWithLifecycle()
     val problem by viewModel.problem.collectAsStateWithLifecycle()
     val restartToken by viewModel.restartToken.collectAsStateWithLifecycle()
 
@@ -145,7 +148,7 @@ private fun ReaderApp(viewModel: ReaderViewModel = viewModel()) {
             modifier = Modifier.fillMaxSize(),
         )
 
-        PacketEventsBelowRoi(events = packetEvents)
+        PacketEventsBelowGuide(events = packetEvents, message = decodedMessage)
 
         DiagnosticsOverlay(viewModel = viewModel, frame = frame)
 
@@ -314,7 +317,10 @@ private fun DetectionOverlay(
 }
 
 @Composable
-private fun PacketEventsBelowRoi(events: List<PacketEvent>) {
+private fun PacketEventsBelowGuide(
+    events: List<PacketEvent>,
+    message: DecodedMessage?,
+) {
     BoxWithConstraints(Modifier.fillMaxSize()) {
         val roiWidth = maxWidth * ReaderRoi.WIDTH_FRACTION
         val roiHeight = (roiWidth * ReaderRoi.ROI_ASPECT_RATIO).coerceAtMost(maxHeight)
@@ -336,6 +342,41 @@ private fun PacketEventsBelowRoi(events: List<PacketEvent>) {
                             else -> 0.30f
                         },
                     ),
+                )
+            }
+            if (message != null) {
+                DecodedMessageGrid(message = message)
+            }
+        }
+    }
+}
+
+@Composable
+private fun DecodedMessageGrid(message: DecodedMessage) {
+    Canvas(
+        modifier = Modifier
+            .width(126.dp)
+            .height(126.dp)
+            .background(Color.White, RoundedCornerShape(3.dp))
+            .padding(8.dp),
+    ) {
+        val gap = 2.dp.toPx()
+        val cell = (minOf(size.width, size.height) - gap * 5f) / 6f
+        val bits = message.bits
+        for (row in 0 until 6) {
+            for (col in 0 until 6) {
+                val index = row * 6 + col
+                val on = index < bits.size && bits[index]
+                drawRect(
+                    color = if (on) Color.Black else Color.White,
+                    topLeft = Offset(col * (cell + gap), row * (cell + gap)),
+                    size = Size(cell, cell),
+                )
+                drawRect(
+                    color = Color(0x33000000),
+                    topLeft = Offset(col * (cell + gap), row * (cell + gap)),
+                    size = Size(cell, cell),
+                    style = Stroke(width = 1.dp.toPx()),
                 )
             }
         }

@@ -92,6 +92,11 @@
       gap: 16px;
     }
 
+    .actions {
+      display: grid;
+      gap: 10px;
+    }
+
     .device {
       width: var(--target-width);
       height: var(--target-height);
@@ -185,6 +190,25 @@
       color: var(--fg);
     }
 
+    .message-grid {
+      display: grid;
+      grid-template-columns: repeat(6, 1fr);
+      gap: 4px;
+      width: min(100%, 216px);
+    }
+
+    .pixel {
+      aspect-ratio: 1;
+      border: 1px solid var(--kbd-border);
+      border-radius: 3px;
+      background: #07080a;
+      cursor: crosshair;
+    }
+
+    .pixel[data-on="1"] {
+      background: var(--fg);
+    }
+
     @media (max-width: 760px) {
       main {
         grid-template-columns: 1fr;
@@ -225,59 +249,86 @@
 
       <section class="controls">
         <div class="compact">
-          <label for="packet">packet</label>
-          <input id="packet" value="10101" maxlength="5" inputmode="numeric" pattern="[01]{5}">
-        </div>
-
-        <div class="compact">
-          <label for="sequence">sequence</label>
-          <input id="sequence" value="00000 10000 01000 00100 00010 00001 11111">
-        </div>
-
-        <div class="compact">
           <label for="fps">rate</label>
-          <input id="fps" type="number" min="1" max="30" value="8">
+          <input id="fps" type="number" min="1" max="30" value="4">
         </div>
 
-        <button class="primary" id="play" type="button">Start</button>
-        <button id="step" type="button">Step</button>
+        <div class="actions">
+          <button class="primary" id="play" type="button">Start</button>
+        </div>
+
+        <div class="compact">
+          <label>message</label>
+          <div class="message-grid" id="messageGrid" aria-label="6 by 6 binary message"></div>
+        </div>
       </section>
 
-      <output id="binaryOut" hidden>10101</output>
-      <output id="decimalOut" hidden>21</output>
+      <output id="binaryOut" hidden>00000</output>
     </aside>
   </main>
 
   <script>
     const leds = [...document.querySelectorAll(".led")];
-    const packet = document.getElementById("packet");
-    const sequence = document.getElementById("sequence");
     const fps = document.getElementById("fps");
     const play = document.getElementById("play");
-    const stepButton = document.getElementById("step");
+    const messageGrid = document.getElementById("messageGrid");
     const binaryOut = document.getElementById("binaryOut");
-    const decimalOut = document.getElementById("decimalOut");
 
-    let bits = "10101";
+    const PREAMBLE = ["00000", "01010", "10101", "11111"];
+    const MESSAGE_BITS = 36;
+    const PARITY_BITS = 24;
+    const CODEWORD_BITS = MESSAGE_BITS + PARITY_BITS;
+    const PACKET_BITS = 5;
+    const PACKET_COUNT = CODEWORD_BITS / PACKET_BITS;
+    const pixels = new Array(MESSAGE_BITS).fill(false);
+
+    let bits = "00000";
     let timer = null;
     let nextIndex = 0;
+    let txPackets = [];
 
     function normalize(value) {
       return String(value).replace(/[^01]/g, "").padEnd(5, "0").slice(0, 5);
     }
 
-    function packets() {
-      return sequence.value
-        .split(/[\s,;|]+/)
-        .filter(Boolean)
-        .map(normalize);
+    function messageBits() {
+      return pixels.map((on) => on ? "1" : "0").join("");
+    }
+
+    function parityGroup(index) {
+      return [
+        (index * 5) % MESSAGE_BITS,
+        (index * 5 + 7) % MESSAGE_BITS,
+        (index * 5 + 13) % MESSAGE_BITS,
+        (index * 5 + 23) % MESSAGE_BITS,
+      ];
+    }
+
+    function parityBits(payload) {
+      let parity = "";
+      for (let index = 0; index < PARITY_BITS; index += 1) {
+        let bit = 0;
+        parityGroup(index).forEach((payloadIndex) => {
+          if (payload[payloadIndex] === "1") bit ^= 1;
+        });
+        parity += String(bit);
+      }
+      return parity;
+    }
+
+    function encodedPackets() {
+      const payload = messageBits();
+      const codeword = (payload + parityBits(payload)).padEnd(CODEWORD_BITS, "0");
+      const packets = [];
+      for (let offset = 0; offset < codeword.length; offset += PACKET_BITS) {
+        packets.push(codeword.slice(offset, offset + PACKET_BITS));
+      }
+      return [...PREAMBLE, ...packets];
     }
 
     function render(nextBits) {
       bits = normalize(nextBits);
-      packet.value = bits;
       binaryOut.textContent = bits;
-      decimalOut.textContent = String(Number.parseInt(bits, 2));
 
       leds.forEach((led) => {
         const bit = Number(led.dataset.bit);
@@ -287,36 +338,66 @@
     }
 
     function step() {
-      const list = packets();
-      if (list.length === 0) {
-        nextIndex = 0;
-        render("00000");
+      if (timer === null && txPackets.length === 0) {
+        txPackets = encodedPackets();
+      }
+      if (nextIndex >= txPackets.length) {
+        completeTransmission();
         return;
       }
 
-      render(list[nextIndex % list.length]);
-      nextIndex = (nextIndex + 1) % list.length;
+      render(txPackets[nextIndex]);
+      nextIndex += 1;
     }
 
     function start() {
       if (timer !== null) return;
+      txPackets = encodedPackets();
+      nextIndex = 0;
       step();
       timer = window.setInterval(step, 1000 / Math.max(1, Math.min(30, Number(fps.value) || 1)));
       play.textContent = "Stop";
     }
 
     function stop() {
-      if (timer === null) return;
-      window.clearInterval(timer);
-      timer = null;
+      if (timer !== null) {
+        window.clearInterval(timer);
+        timer = null;
+      }
       play.textContent = "Start";
+      finishTransmission();
     }
 
-    packet.addEventListener("input", () => render(packet.value));
-    sequence.addEventListener("input", () => {
+    function completeTransmission() {
+      if (timer !== null) {
+        window.clearInterval(timer);
+        timer = null;
+      }
+      play.textContent = "Start";
+      finishTransmission();
+    }
+
+    function finishTransmission() {
       nextIndex = 0;
-    });
-    stepButton.addEventListener("click", step);
+      txPackets = [];
+      render("00000");
+    }
+
+    function renderMessageGrid() {
+      messageGrid.replaceChildren();
+      pixels.forEach((on, index) => {
+        const cell = document.createElement("button");
+        cell.className = "pixel";
+        cell.type = "button";
+        cell.dataset.on = on ? "1" : "0";
+        cell.addEventListener("click", () => {
+          pixels[index] = !pixels[index];
+          cell.dataset.on = pixels[index] ? "1" : "0";
+        });
+        messageGrid.append(cell);
+      });
+    }
+
     play.addEventListener("click", () => timer === null ? start() : stop());
     fps.addEventListener("input", () => {
       if (timer !== null) {
@@ -325,6 +406,7 @@
       }
     });
 
+    renderMessageGrid();
     render(bits);
   </script>
 </body>

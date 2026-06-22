@@ -71,6 +71,11 @@ data class PacketEvent(
     val bits: String?,
 )
 
+data class DecodedMessage(
+    val id: Long,
+    val bits: BooleanArray,
+)
+
 data class DecoderTimingWindow(
     val samplesMs: List<Float> = emptyList(),
     val avgMs: Float = 0f,

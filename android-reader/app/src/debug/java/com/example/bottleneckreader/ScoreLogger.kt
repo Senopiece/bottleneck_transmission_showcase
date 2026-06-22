@@ -9,16 +9,17 @@ class ScoreLogger {
     fun log(
         timestampNs: Long,
         scores: FloatArray?,
-        event: LedDebouncer.Result?,
+        event: PacketClockDecoder.Result?,
+        state: String,
     ) {
         if (!headerLogged) {
             Log.d(SCORE_CSV_TAG, "timestampNs,detected,s0,s1,s2,s3,s4,event")
             headerLogged = true
         }
         val eventValue = when {
-            event == null -> ""
+            event == null -> state
             event.bits == null -> "null"
-            else -> event.bits
+            else -> event.bits + " " + state
         }
         val scoreColumns = if (scores == null) {
             ",,,,"

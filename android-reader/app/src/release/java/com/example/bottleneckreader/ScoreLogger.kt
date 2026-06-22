@@ -4,7 +4,8 @@ class ScoreLogger {
     fun log(
         timestampNs: Long,
         scores: FloatArray?,
-        event: LedDebouncer.Result?,
+        event: PacketClockDecoder.Result?,
+        state: String,
     ) {
     }
 }
