@@ -18,8 +18,9 @@ class ScoreLogger {
         }
         val eventValue = when {
             event == null -> state
-            event.bits == null -> "null"
-            else -> event.bits + " " + state
+            event.failure != null -> "fail ${event.failure.name}"
+            event.bits == null -> "erasure ${event.packetKind ?: "unknown"} $state"
+            else -> event.bits + " ${event.packetKind ?: "unknown"} $state"
         }
         val scoreColumns = if (scores == null) {
             ",,,,"

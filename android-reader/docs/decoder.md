@@ -68,11 +68,13 @@ The packet clock has four phases:
 3. Wait for the remaining preamble packets: `01010`, `10101`, `11111`.
 4. Use the measured preamble deltas as the packet period and emit one packet per period.
 
-If marker detection is lost or the camera stream is interrupted, the clock emits `null` immediately and returns to the first phase.
+The visible decode progress starts on `01010`, not on idle zeros. Progress includes the three visible preamble packets plus the twelve payload packets.
+
+If marker detection is lost during the active payload phase, the clock does not immediately abort. It continues ticking by time and emits erasure packets for symbol windows that could not be sampled. Camera/app stream interruption is still treated as a hard failure.
 
 During the active phase the emitted packet is not sampled from a single frame at the period boundary. The decoder accumulates LED scores from the middle of each symbol window and thresholds the average score. This avoids reading exposure tails and transition frames as payload bits.
 
-If a whole symbol period is skipped, or no frame lands inside the middle sampling window, the clock treats this as a stream gap and emits `null` instead of fabricating a packet from a boundary frame.
+If a whole symbol period is skipped, or no frame lands inside the middle sampling window, the clock emits an erasure instead of fabricating a packet from a boundary frame.
 
 ## Message Codeword
 
@@ -82,4 +84,4 @@ The virtual device sends a 6x6 binary image as 36 payload bits. The transmitted 
 - 24 low-density parity bits
 - 60 total bits, sent as 12 packets of 5 bits after the four-packet preamble
 
-The Android side runs a small iterative bit-flip decoder over the sparse parity checks, then displays the first 36 decoded bits as the 6x6 image. If the parity checks still do not converge, no image is emitted; this avoids displaying a confident-looking but shifted or corrupted message.
+The Android side first tries to fill erasures from single-unknown parity checks. Then it runs a small iterative bit-flip decoder over the sparse parity checks and displays the first 36 decoded bits as the 6x6 image. If the parity checks still do not converge, no image is emitted; this avoids displaying a confident-looking but shifted or corrupted message.

@@ -71,6 +71,14 @@ data class PacketEvent(
     val bits: String?,
 )
 
+data class DecodeProgress(
+    val receivedPackets: Int = 0,
+    val requiredPackets: Int = 0,
+    val visible: Boolean = false,
+    val failed: Boolean = false,
+    val failureId: Long = 0L,
+)
+
 data class DecodedMessage(
     val id: Long,
     val bits: BooleanArray,

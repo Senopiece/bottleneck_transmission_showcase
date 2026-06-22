@@ -44,14 +44,16 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -129,7 +131,7 @@ private fun ReaderApp(viewModel: ReaderViewModel = viewModel()) {
 
     val frame by viewModel.frame.collectAsStateWithLifecycle()
     val notices by viewModel.notices.collectAsStateWithLifecycle()
-    val packetEvents by viewModel.packetEvents.collectAsStateWithLifecycle()
+    val decodeProgress by viewModel.decodeProgress.collectAsStateWithLifecycle()
     val decodedMessage by viewModel.decodedMessage.collectAsStateWithLifecycle()
     val problem by viewModel.problem.collectAsStateWithLifecycle()
     val restartToken by viewModel.restartToken.collectAsStateWithLifecycle()
@@ -148,7 +150,11 @@ private fun ReaderApp(viewModel: ReaderViewModel = viewModel()) {
             modifier = Modifier.fillMaxSize(),
         )
 
-        PacketEventsBelowGuide(events = packetEvents, message = decodedMessage)
+        DecodeProgressBelowGuide(
+            progress = decodeProgress,
+            message = decodedMessage,
+            onStop = viewModel::stopDecoding,
+        )
 
         DiagnosticsOverlay(viewModel = viewModel, frame = frame)
 
@@ -317,10 +323,18 @@ private fun DetectionOverlay(
 }
 
 @Composable
-private fun PacketEventsBelowGuide(
-    events: List<PacketEvent>,
+private fun DecodeProgressBelowGuide(
+    progress: DecodeProgress,
     message: DecodedMessage?,
+    onStop: () -> Unit,
 ) {
+    val haptic = LocalHapticFeedback.current
+    LaunchedEffect(progress.failureId) {
+        if (progress.failed && progress.failureId != 0L) {
+            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+        }
+    }
+
     BoxWithConstraints(Modifier.fillMaxSize()) {
         val roiWidth = maxWidth * ReaderRoi.WIDTH_FRACTION
         val roiHeight = (roiWidth * ReaderRoi.ROI_ASPECT_RATIO).coerceAtMost(maxHeight)
@@ -332,20 +346,62 @@ private fun PacketEventsBelowGuide(
             verticalArrangement = Arrangement.spacedBy(6.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            events.take(3).forEachIndexed { index, event ->
-                DecodedBadge(
-                    value = event.bits ?: "null",
-                    modifier = Modifier.alpha(
-                        when (index) {
-                            0 -> 1f
-                            1 -> 0.58f
-                            else -> 0.30f
-                        },
-                    ),
+            if (progress.visible) {
+                DecodeProgressCard(progress = progress, onStop = onStop)
+            } else if (message != null) {
+                DecodedMessageGrid(message = message)
+            }
+        }
+    }
+}
+
+@Composable
+private fun DecodeProgressCard(
+    progress: DecodeProgress,
+    onStop: () -> Unit,
+) {
+    val required = progress.requiredPackets.coerceAtLeast(1)
+    val received = progress.receivedPackets.coerceIn(0, required)
+    val ratio = received.toFloat() / required.toFloat()
+    val background = if (progress.failed) Color(0xFFFF3B30) else Color.White
+    val foreground = if (progress.failed) Color.White else Color.Black
+    Box(
+        modifier = Modifier
+            .background(background, RoundedCornerShape(3.dp))
+            .padding(horizontal = 16.dp, vertical = 10.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Column(
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            Text(
+                text = "${(ratio * 100f).toInt()}%  $received / $required",
+                color = foreground,
+                fontSize = 16.sp,
+                fontWeight = FontWeight.Bold,
+                letterSpacing = 0.sp,
+            )
+            Canvas(
+                modifier = Modifier
+                    .width(152.dp)
+                    .height(8.dp),
+            ) {
+                drawRoundRect(
+                    color = if (progress.failed) Color(0x44FFFFFF) else Color(0x22000000),
+                    size = size,
+                    cornerRadius = CornerRadius(3.dp.toPx(), 3.dp.toPx()),
+                )
+                drawRoundRect(
+                    color = foreground,
+                    size = Size(size.width * ratio, size.height),
+                    cornerRadius = CornerRadius(3.dp.toPx(), 3.dp.toPx()),
                 )
             }
-            if (message != null) {
-                DecodedMessageGrid(message = message)
+            if (!progress.failed) {
+                Button(onClick = onStop) {
+                    Text("Stop")
+                }
             }
         }
     }
@@ -448,27 +504,6 @@ private object AcquireGuideGeometry {
 
     val slotFractions: FloatArray = FloatArray(5) { index ->
         (firstLedOffsetMm + index * stepMm) / markerDistanceMm
-    }
-}
-
-@Composable
-private fun DecodedBadge(
-    value: String,
-    modifier: Modifier = Modifier,
-) {
-    Box(
-        modifier = modifier
-            .background(Color.White, RoundedCornerShape(3.dp))
-            .padding(horizontal = 22.dp, vertical = 9.dp),
-        contentAlignment = Alignment.Center,
-    ) {
-        Text(
-            text = value,
-            color = Color.Black,
-            fontSize = 22.sp,
-            fontWeight = FontWeight.Bold,
-            letterSpacing = 0.sp,
-        )
     }
 }
 

@@ -1,5 +1,6 @@
 package com.example.bottleneckreader
 
+import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.delay
@@ -14,9 +15,13 @@ class ReaderViewModel : ViewModel() {
     private val ids = AtomicLong(0)
     private val packetIds = AtomicLong(0)
     private val messageIds = AtomicLong(0)
+    private val progressFailureIds = AtomicLong(0)
     private val packetDecoder = PacketClockDecoder()
     private val scoreLogger = ScoreLogger()
-    private val messagePackets = ArrayList<String>(MESSAGE_PACKET_COUNT)
+    private val messagePackets = ArrayList<String?>(MESSAGE_PACKET_COUNT)
+    private var preambleProgressPackets = 0
+    private var lastDebugFailureMessage: String? = null
+    private var lastDebugFailureAtNs = 0L
 
     private val _frame = MutableStateFlow<DetectionFrame?>(null)
     val frame: StateFlow<DetectionFrame?> = _frame.asStateFlow()
@@ -26,6 +31,9 @@ class ReaderViewModel : ViewModel() {
 
     private val _packetEvents = MutableStateFlow<List<PacketEvent>>(emptyList())
     val packetEvents: StateFlow<List<PacketEvent>> = _packetEvents.asStateFlow()
+
+    private val _decodeProgress = MutableStateFlow(DecodeProgress(requiredPackets = TOTAL_PROGRESS_PACKETS))
+    val decodeProgress: StateFlow<DecodeProgress> = _decodeProgress.asStateFlow()
 
     private val _decodedMessage = MutableStateFlow<DecodedMessage?>(null)
     val decodedMessage: StateFlow<DecodedMessage?> = _decodedMessage.asStateFlow()
@@ -84,6 +92,18 @@ class ReaderViewModel : ViewModel() {
         _problem.value = null
     }
 
+    fun stopDecoding() {
+        if (!_decodeProgress.value.visible || _decodeProgress.value.failed) return
+        while (messagePackets.size < MESSAGE_PACKET_COUNT) {
+            messagePackets += null
+        }
+        updateDecodeProgress()
+        decodeMessage()
+        messagePackets.clear()
+        preambleProgressPackets = 0
+        packetDecoder.finishMessage()
+    }
+
     private fun enqueueNotice(message: String) {
         val id = ids.incrementAndGet()
         _notices.update { it + ReaderNotice(id = id, message = message) }
@@ -105,7 +125,8 @@ class ReaderViewModel : ViewModel() {
             scoreLogger.log(frame.timestampNs, scores, event, packetDecoder.debugState)
         }
         event?.let { result ->
-            onPacketEvent(frame.timestampNs, result.bits)
+            onPacketResult(frame.timestampNs, result)
+            notifyDebugDecodeFailure(result.failure, frame.timestampNs)
         }
     }
 
@@ -114,22 +135,53 @@ class ReaderViewModel : ViewModel() {
         if (Diagnostics.enabled) {
             scoreLogger.log(timestampNs, null, event, packetDecoder.debugState)
         }
-        event?.let { result ->
-            onPacketEvent(timestampNs, result.bits)
+        if (event == null) {
+            preambleProgressPackets = 0
+            messagePackets.clear()
+            updateDecodeProgress(visible = false)
+        } else {
+            val result = event
+            onPacketResult(timestampNs, result)
+            notifyDebugDecodeFailure(result.failure, timestampNs)
         }
     }
 
-    private fun onPacketEvent(timestampNs: Long, bits: String?) {
+    private fun onPacketResult(timestampNs: Long, result: PacketClockDecoder.Result) {
+        val failure = result.failure
+        if (failure != null) {
+            failProgress(failure.message)
+            return
+        }
+
+        when (result.packetKind) {
+            PacketClockDecoder.PacketKind.Preamble -> onPreamblePacket(timestampNs, result.bits)
+            PacketClockDecoder.PacketKind.Payload -> onPayloadPacket(timestampNs, result.bits)
+            null -> Unit
+        }
+    }
+
+    private fun onPreamblePacket(timestampNs: Long, bits: String?) {
+        if (bits == null) return
         appendPacketEvent(timestampNs, bits)
-        if (bits == null) {
+        if (preambleProgressPackets == 0) {
             messagePackets.clear()
+            _decodedMessage.value = null
+        }
+        preambleProgressPackets = (preambleProgressPackets + 1).coerceAtMost(PREAMBLE_PROGRESS_PACKETS)
+        updateDecodeProgress()
+        logDebug("preamble=$bits progress=${progressCount()}/$TOTAL_PROGRESS_PACKETS")
+    }
+
+    private fun onPayloadPacket(timestampNs: Long, bits: String?) {
+        appendPacketEvent(timestampNs, bits)
+        if (preambleProgressPackets < PREAMBLE_PROGRESS_PACKETS) {
+            failProgress("Decode failed: payload arrived before complete preamble")
             return
         }
         if (messagePackets.size >= MESSAGE_PACKET_COUNT) return
-        if (messagePackets.isEmpty()) {
-            _decodedMessage.value = null
-        }
         messagePackets += bits
+        updateDecodeProgress()
+        logDebug("payload=${bits ?: "erasure"} progress=${progressCount()}/$TOTAL_PROGRESS_PACKETS")
         if (messagePackets.size == MESSAGE_PACKET_COUNT) {
             decodeMessage()
             messagePackets.clear()
@@ -147,18 +199,135 @@ class ReaderViewModel : ViewModel() {
     }
 
     private fun decodeMessage() {
-        val codeword = messagePackets.joinToString(separator = "")
+        if (messagePackets.size < MESSAGE_PACKET_COUNT) return
+        val codeword = messagePackets.joinToString(separator = "") { it ?: ERASURE_PACKET }
         if (codeword.length < CODEWORD_BITS) return
-        val decoded = decodeSparseParityCodeword(codeword) ?: return
+        val decoded = decodeSparseParityCodeword(codeword)
+        if (decoded == null) {
+            failProgress("Decode failed: parity checks did not converge")
+            logDebug("message decode failed: parity checks did not converge")
+            return
+        }
         val pixels = BooleanArray(MESSAGE_BITS) { index -> decoded[index] }
         _decodedMessage.value = DecodedMessage(
             id = messageIds.incrementAndGet(),
             bits = pixels,
         )
+        logDebug("message decoded")
+        preambleProgressPackets = 0
+        updateDecodeProgress(visible = false)
+    }
+
+    private fun updateDecodeProgress(
+        visible: Boolean = progressCount() > 0,
+        failed: Boolean = false,
+        failureId: Long = _decodeProgress.value.failureId,
+    ) {
+        _decodeProgress.value = DecodeProgress(
+            receivedPackets = progressCount(),
+            requiredPackets = TOTAL_PROGRESS_PACKETS,
+            visible = visible,
+            failed = failed,
+            failureId = failureId,
+        )
+    }
+
+    private fun progressCount(): Int {
+        return preambleProgressPackets + messagePackets.size
+    }
+
+    private fun failProgress(message: String) {
+        notifyDebugDecodeFailure(message, System.nanoTime())
+        logDebug(message)
+        packetDecoder.finishMessage()
+        if (progressCount() == 0) {
+            preambleProgressPackets = 0
+            messagePackets.clear()
+            updateDecodeProgress(visible = false)
+            return
+        }
+        val failureId = progressFailureIds.incrementAndGet()
+        updateDecodeProgress(
+            visible = true,
+            failed = true,
+            failureId = failureId,
+        )
+        viewModelScope.launch {
+            delay(PROGRESS_FAILURE_VISIBLE_MS)
+            preambleProgressPackets = 0
+            messagePackets.clear()
+            updateDecodeProgress(visible = false, failed = false, failureId = failureId)
+        }
+    }
+
+    private fun notifyDebugDecodeFailure(reason: PacketClockDecoder.FailureReason?, timestampNs: Long) {
+        if (reason == null) return
+        notifyDebugDecodeFailure(reason.message, timestampNs)
+    }
+
+    private fun notifyDebugDecodeFailure(message: String, timestampNs: Long) {
+        if (!Diagnostics.enabled) return
+        if (message == lastDebugFailureMessage && timestampNs - lastDebugFailureAtNs < DEBUG_FAILURE_NOTICE_COOLDOWN_NS) {
+            return
+        }
+        lastDebugFailureMessage = message
+        lastDebugFailureAtNs = timestampNs
+        logDebug(message)
+        enqueueNotice(message)
+    }
+
+    private fun logDebug(message: String) {
+        if (!Diagnostics.enabled) return
+        Log.d(DEBUG_TAG, message)
     }
 
     private fun decodeSparseParityCodeword(codeword: String): BooleanArray? {
-        val bits = BooleanArray(CODEWORD_BITS) { index -> codeword[index] == '1' }
+        val bits = BooleanArray(CODEWORD_BITS)
+        val known = BooleanArray(CODEWORD_BITS)
+        for (index in 0 until CODEWORD_BITS) {
+            when (codeword[index]) {
+                '0' -> {
+                    bits[index] = false
+                    known[index] = true
+                }
+                '1' -> {
+                    bits[index] = true
+                    known[index] = true
+                }
+            }
+        }
+        solveErasures(bits, known)
+        if (known.any { !it }) return null
+        return decodeKnownCodeword(bits)
+    }
+
+    private fun solveErasures(bits: BooleanArray, known: BooleanArray) {
+        var changed: Boolean
+        do {
+            changed = false
+            for (check in 0 until PARITY_BITS) {
+                val indexes = LDPC_GROUPS[check] + intArrayOf(MESSAGE_BITS + check)
+                var unknownIndex = -1
+                var unknownCount = 0
+                var parity = false
+                for (index in indexes) {
+                    if (known[index]) {
+                        parity = parity != bits[index]
+                    } else {
+                        unknownIndex = index
+                        unknownCount += 1
+                    }
+                }
+                if (unknownCount == 1) {
+                    bits[unknownIndex] = parity
+                    known[unknownIndex] = true
+                    changed = true
+                }
+            }
+        } while (changed)
+    }
+
+    private fun decodeKnownCodeword(bits: BooleanArray): BooleanArray? {
         val votes = IntArray(CODEWORD_BITS)
 
         repeat(LDPC_MAX_ITERATIONS) {
@@ -235,15 +404,21 @@ class ReaderViewModel : ViewModel() {
     private companion object {
         const val LED_COUNT = 5
         const val MAX_PACKET_EVENTS = 3
+        const val PREAMBLE_PROGRESS_PACKETS = 3
         const val MESSAGE_BITS = 36
         const val PARITY_BITS = 24
         const val CODEWORD_BITS = MESSAGE_BITS + PARITY_BITS
         const val MESSAGE_PACKET_COUNT = CODEWORD_BITS / LED_COUNT
+        const val TOTAL_PROGRESS_PACKETS = PREAMBLE_PROGRESS_PACKETS + MESSAGE_PACKET_COUNT
         const val LDPC_MAX_ITERATIONS = 8
         const val MIN_BIT_FLIP_VOTES = 2
         const val TIMING_WINDOW_SIZE = 90
         const val NOTICE_VISIBLE_MS = 3_200L
         const val NOTICE_EXIT_MS = 420L
+        const val PROGRESS_FAILURE_VISIBLE_MS = 760L
+        const val DEBUG_FAILURE_NOTICE_COOLDOWN_NS = 1_500_000_000L
+        const val DEBUG_TAG = "ReaderDecode"
+        const val ERASURE_PACKET = "?????"
 
         val LDPC_GROUPS: Array<IntArray> = Array(PARITY_BITS) { index ->
             intArrayOf(

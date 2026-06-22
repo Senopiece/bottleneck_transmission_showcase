@@ -1,7 +1,24 @@
 package com.example.bottleneckreader
 
 class PacketClockDecoder {
-    data class Result(val bits: String?)
+    data class Result(
+        val bits: String? = null,
+        val packetKind: PacketKind? = null,
+        val failure: FailureReason? = null,
+    )
+
+    enum class PacketKind {
+        Preamble,
+        Payload,
+    }
+
+    enum class FailureReason(val message: String) {
+        MarkerLost("Decode failed: marker lost"),
+        StreamInterrupted("Decode failed: stream interrupted"),
+        PreambleLost("Decode failed: preamble lost"),
+        SymbolSkipped("Decode failed: symbol period skipped"),
+        NoSymbolSamples("Decode failed: no samples in symbol window"),
+    }
 
     val debugState: String
         get() = when (phase) {
@@ -19,6 +36,7 @@ class PacketClockDecoder {
     private var phase = Phase.WaitingZeros
     private var zeroFrames = 0
     private var preambleIndex = 1
+    private var preambleStarted = false
     private var lastPreambleAtNs = 0L
     private var periodSumNs = 0L
     private var periodSamples = 0
@@ -32,9 +50,7 @@ class PacketClockDecoder {
 
     fun accept(timestampNs: Long, scores: FloatArray?): Result? {
         if (scores == null || scores.size != BIT_COUNT) {
-            val hadLock = phase != Phase.WaitingZeros
-            resetInternal()
-            return if (hadLock) Result(null) else null
+            return acceptMissingDetection(timestampNs)
         }
 
         val packet = scoresToPacket(scores)
@@ -48,7 +64,7 @@ class PacketClockDecoder {
     fun reset(): Result? {
         val hadLock = phase != Phase.WaitingZeros
         resetInternal()
-        return if (hadLock) Result(null) else null
+        return if (hadLock) Result(failure = FailureReason.StreamInterrupted) else null
     }
 
     fun finishMessage() {
@@ -68,19 +84,31 @@ class PacketClockDecoder {
         return null
     }
 
+    private fun acceptMissingDetection(timestampNs: Long): Result? {
+        return when (phase) {
+            Phase.WaitingZeros -> null
+            Phase.WaitingPreamble -> {
+                if (preambleStarted) countPreambleMiss() else null
+            }
+            Phase.Active -> acceptActive(scores = null, timestampNs = timestampNs)
+        }
+    }
+
     private fun acceptPreamble(packet: String, timestampNs: Long): Result? {
         val expected = PREAMBLE[preambleIndex]
         val previous = PREAMBLE[preambleIndex - 1]
 
-        when {
+        return when {
             matches(packet, expected) -> {
                 preambleMisses = 0
+                preambleStarted = true
                 if (lastPreambleAtNs != 0L) {
                     periodSumNs += timestampNs - lastPreambleAtNs
                     periodSamples += 1
                 }
                 lastPreambleAtNs = timestampNs
                 preambleIndex += 1
+                val result = Result(bits = expected, packetKind = PacketKind.Preamble)
 
                 if (preambleIndex == PREAMBLE.size) {
                     periodNs = if (periodSamples > 0) {
@@ -93,39 +121,39 @@ class PacketClockDecoder {
                     clearSymbolSamples()
                     phase = Phase.Active
                 }
+                result
             }
-            matches(packet, previous) -> Unit
+            matches(packet, previous) -> null
             packet == ZERO_PACKET -> {
-                if (preambleIndex != 1) countPreambleMiss()
+                if (preambleIndex != 1) countPreambleMiss() else null
             }
             else -> countPreambleMiss()
         }
-        return null
     }
 
-    private fun countPreambleMiss() {
+    private fun countPreambleMiss(): Result? {
         preambleMisses += 1
-        if (preambleMisses > MAX_PREAMBLE_MISSES) resetInternal()
+        if (preambleMisses <= MAX_PREAMBLE_MISSES) return null
+        resetInternal()
+        return Result(failure = FailureReason.PreambleLost)
     }
 
-    private fun acceptActive(scores: FloatArray, timestampNs: Long): Result? {
+    private fun acceptActive(scores: FloatArray?, timestampNs: Long): Result? {
         if (timestampNs < nextEmitAtNs) {
-            sampleActiveSymbol(scores, timestampNs)
+            if (scores != null) sampleActiveSymbol(scores, timestampNs)
             return null
         }
 
         val periodsElapsed = ((timestampNs - nextEmitAtNs) / periodNs).coerceAtLeast(0L)
-        if (periodsElapsed > 0L || symbolSampleCount == 0) {
-            resetInternal()
-            return Result(null)
-        }
-
-        val result = Result(symbolPacket())
-        val emittedBoundaryNs = nextEmitAtNs + periodsElapsed * periodNs
+        val result = Result(
+            bits = if (periodsElapsed > 0L || symbolSampleCount == 0) null else symbolPacket(),
+            packetKind = PacketKind.Payload,
+        )
+        val emittedBoundaryNs = nextEmitAtNs
         symbolStartNs = emittedBoundaryNs
         nextEmitAtNs = emittedBoundaryNs + periodNs
         clearSymbolSamples()
-        sampleActiveSymbol(scores, timestampNs)
+        if (scores != null) sampleActiveSymbol(scores, timestampNs)
         return result
     }
 
@@ -168,6 +196,7 @@ class PacketClockDecoder {
 
     private fun resetPreamble() {
         preambleIndex = 1
+        preambleStarted = false
         lastPreambleAtNs = 0L
         periodSumNs = 0L
         periodSamples = 0
