@@ -19,6 +19,7 @@ class ReaderViewModel : ViewModel() {
     private val packetDecoder = PacketClockDecoder()
     private val scoreLogger = ScoreLogger()
     private val messagePackets = ArrayList<String?>(MESSAGE_PACKET_COUNT)
+    private val messageReliability = ArrayList<FloatArray?>(MESSAGE_PACKET_COUNT)
     private var preambleProgressPackets = 0
     private var lastDebugFailureMessage: String? = null
     private var lastDebugFailureAtNs = 0L
@@ -96,10 +97,12 @@ class ReaderViewModel : ViewModel() {
         if (!_decodeProgress.value.visible || _decodeProgress.value.failed) return
         while (messagePackets.size < MESSAGE_PACKET_COUNT) {
             messagePackets += null
+            messageReliability += null
         }
         updateDecodeProgress()
         decodeMessage()
         messagePackets.clear()
+        messageReliability.clear()
         preambleProgressPackets = 0
         packetDecoder.finishMessage()
     }
@@ -138,6 +141,7 @@ class ReaderViewModel : ViewModel() {
         if (event == null) {
             preambleProgressPackets = 0
             messagePackets.clear()
+            messageReliability.clear()
             updateDecodeProgress(visible = false)
         } else {
             val result = event
@@ -155,7 +159,7 @@ class ReaderViewModel : ViewModel() {
 
         when (result.packetKind) {
             PacketClockDecoder.PacketKind.Preamble -> onPreamblePacket(timestampNs, result.bits)
-            PacketClockDecoder.PacketKind.Payload -> onPayloadPacket(timestampNs, result.bits)
+            PacketClockDecoder.PacketKind.Payload -> onPayloadPacket(timestampNs, result.bits, result.bitReliability)
             null -> Unit
         }
     }
@@ -165,6 +169,7 @@ class ReaderViewModel : ViewModel() {
         appendPacketEvent(timestampNs, bits)
         if (preambleProgressPackets == 0) {
             messagePackets.clear()
+            messageReliability.clear()
             _decodedMessage.value = null
         }
         preambleProgressPackets = (preambleProgressPackets + 1).coerceAtMost(PREAMBLE_PROGRESS_PACKETS)
@@ -172,7 +177,7 @@ class ReaderViewModel : ViewModel() {
         logDebug("preamble=$bits progress=${progressCount()}/$TOTAL_PROGRESS_PACKETS")
     }
 
-    private fun onPayloadPacket(timestampNs: Long, bits: String?) {
+    private fun onPayloadPacket(timestampNs: Long, bits: String?, bitReliability: FloatArray?) {
         appendPacketEvent(timestampNs, bits)
         if (preambleProgressPackets < PREAMBLE_PROGRESS_PACKETS) {
             failProgress("Decode failed: payload arrived before complete preamble")
@@ -180,11 +185,13 @@ class ReaderViewModel : ViewModel() {
         }
         if (messagePackets.size >= MESSAGE_PACKET_COUNT) return
         messagePackets += bits
+        messageReliability += bitReliability?.takeIf { it.size == LED_COUNT }?.copyOf()
         updateDecodeProgress()
         logDebug("payload=${bits ?: "erasure"} progress=${progressCount()}/$TOTAL_PROGRESS_PACKETS")
         if (messagePackets.size == MESSAGE_PACKET_COUNT) {
             decodeMessage()
             messagePackets.clear()
+            messageReliability.clear()
             packetDecoder.finishMessage()
         }
     }
@@ -202,7 +209,8 @@ class ReaderViewModel : ViewModel() {
         if (messagePackets.size < MESSAGE_PACKET_COUNT) return
         val codeword = messagePackets.joinToString(separator = "") { it ?: ERASURE_PACKET }
         if (codeword.length < CODEWORD_BITS) return
-        val decoded = decodeSparseParityCodeword(codeword)
+        logDebug("decode codeword erasures=${codeword.count { it == '?' }} codeword=$codeword")
+        val decoded = decodeSparseParityCodeword(codeword, flattenReliability())
         if (decoded == null) {
             failProgress("Decode failed: parity checks did not converge")
             logDebug("message decode failed: parity checks did not converge")
@@ -216,6 +224,20 @@ class ReaderViewModel : ViewModel() {
         logDebug("message decoded")
         preambleProgressPackets = 0
         updateDecodeProgress(visible = false)
+    }
+
+    private fun flattenReliability(): FloatArray {
+        val reliability = FloatArray(CODEWORD_BITS)
+        var outputIndex = 0
+        for (packetIndex in 0 until MESSAGE_PACKET_COUNT) {
+            val packetReliability = messageReliability.getOrNull(packetIndex)
+            for (bitIndex in 0 until LED_COUNT) {
+                if (outputIndex >= CODEWORD_BITS) break
+                reliability[outputIndex] = packetReliability?.getOrNull(bitIndex) ?: 0f
+                outputIndex += 1
+            }
+        }
+        return reliability
     }
 
     private fun updateDecodeProgress(
@@ -243,6 +265,7 @@ class ReaderViewModel : ViewModel() {
         if (progressCount() == 0) {
             preambleProgressPackets = 0
             messagePackets.clear()
+            messageReliability.clear()
             updateDecodeProgress(visible = false)
             return
         }
@@ -256,6 +279,7 @@ class ReaderViewModel : ViewModel() {
             delay(PROGRESS_FAILURE_VISIBLE_MS)
             preambleProgressPackets = 0
             messagePackets.clear()
+            messageReliability.clear()
             updateDecodeProgress(visible = false, failed = false, failureId = failureId)
         }
     }
@@ -281,27 +305,29 @@ class ReaderViewModel : ViewModel() {
         Log.d(DEBUG_TAG, message)
     }
 
-    private fun decodeSparseParityCodeword(codeword: String): BooleanArray? {
+    private fun decodeSparseParityCodeword(codeword: String, reliability: FloatArray): BooleanArray? {
         val bits = BooleanArray(CODEWORD_BITS)
         val known = BooleanArray(CODEWORD_BITS)
+        val bitReliability = FloatArray(CODEWORD_BITS)
         for (index in 0 until CODEWORD_BITS) {
             when (codeword[index]) {
                 '0' -> {
                     bits[index] = false
                     known[index] = true
+                    bitReliability[index] = reliability.getOrElse(index) { DEFAULT_HARD_BIT_RELIABILITY }
                 }
                 '1' -> {
                     bits[index] = true
                     known[index] = true
+                    bitReliability[index] = reliability.getOrElse(index) { DEFAULT_HARD_BIT_RELIABILITY }
                 }
             }
         }
-        solveErasures(bits, known)
-        if (known.any { !it }) return null
-        return decodeKnownCodeword(bits)
+        solveErasures(bits, known, bitReliability)
+        return decodeWeightedCodeword(bits, bitReliability)
     }
 
-    private fun solveErasures(bits: BooleanArray, known: BooleanArray) {
+    private fun solveErasures(bits: BooleanArray, known: BooleanArray, reliability: FloatArray) {
         var changed: Boolean
         do {
             changed = false
@@ -310,9 +336,13 @@ class ReaderViewModel : ViewModel() {
                 var unknownIndex = -1
                 var unknownCount = 0
                 var parity = false
+                var minKnownReliability = 1f
                 for (index in indexes) {
                     if (known[index]) {
                         parity = parity != bits[index]
+                        if (reliability[index] < minKnownReliability) {
+                            minKnownReliability = reliability[index]
+                        }
                     } else {
                         unknownIndex = index
                         unknownCount += 1
@@ -321,50 +351,49 @@ class ReaderViewModel : ViewModel() {
                 if (unknownCount == 1) {
                     bits[unknownIndex] = parity
                     known[unknownIndex] = true
+                    reliability[unknownIndex] = (minKnownReliability * ERASURE_SOLVE_RELIABILITY_SCALE)
+                        .coerceIn(0f, MAX_SOLVED_ERASURE_RELIABILITY)
                     changed = true
                 }
             }
         } while (changed)
     }
 
-    private fun decodeKnownCodeword(bits: BooleanArray): BooleanArray? {
-        val votes = IntArray(CODEWORD_BITS)
+    private fun decodeWeightedCodeword(bits: BooleanArray, reliability: FloatArray): BooleanArray? {
+        val original = bits.copyOf()
+        var currentCost = codewordCost(bits, original, reliability)
 
         repeat(LDPC_MAX_ITERATIONS) {
-            var missCount = 0
-            java.util.Arrays.fill(votes, 0)
-
-            for (check in 0 until PARITY_BITS) {
-                var parity = bits[MESSAGE_BITS + check]
-                val group = LDPC_GROUPS[check]
-                for (dataIndex in group) {
-                    parity = parity != bits[dataIndex]
-                }
-                if (parity) {
-                    missCount += 1
-                    votes[MESSAGE_BITS + check] += 1
-                    for (dataIndex in group) {
-                        votes[dataIndex] += 1
-                    }
-                }
-            }
-
-            if (missCount == 0) return bits
+            if (parityMissCount(bits) == 0) return bits
 
             var bestIndex = -1
-            var bestVotes = 0
-            for (index in votes.indices) {
-                if (votes[index] > bestVotes) {
-                    bestVotes = votes[index]
+            var bestCost = currentCost
+            for (index in 0 until CODEWORD_BITS) {
+                bits[index] = !bits[index]
+                val candidateCost = codewordCost(bits, original, reliability)
+                bits[index] = !bits[index]
+                if (candidateCost + MIN_COST_IMPROVEMENT < bestCost) {
+                    bestCost = candidateCost
                     bestIndex = index
                 }
             }
 
-            if (bestVotes < MIN_BIT_FLIP_VOTES || bestIndex < 0) return null
+            if (bestIndex < 0) return null
             bits[bestIndex] = !bits[bestIndex]
+            currentCost = bestCost
         }
 
         return if (parityMissCount(bits) == 0) bits else null
+    }
+
+    private fun codewordCost(bits: BooleanArray, original: BooleanArray, reliability: FloatArray): Float {
+        var cost = parityMissCount(bits) * PARITY_MISS_COST
+        for (index in 0 until CODEWORD_BITS) {
+            if (bits[index] != original[index]) {
+                cost += BIT_FLIP_BASE_COST + reliability[index].coerceIn(0f, 1f) * BIT_FLIP_RELIABILITY_COST
+            }
+        }
+        return cost
     }
 
     private fun parityMissCount(bits: BooleanArray): Int {
@@ -410,8 +439,14 @@ class ReaderViewModel : ViewModel() {
         const val CODEWORD_BITS = MESSAGE_BITS + PARITY_BITS
         const val MESSAGE_PACKET_COUNT = CODEWORD_BITS / LED_COUNT
         const val TOTAL_PROGRESS_PACKETS = PREAMBLE_PROGRESS_PACKETS + MESSAGE_PACKET_COUNT
-        const val LDPC_MAX_ITERATIONS = 8
-        const val MIN_BIT_FLIP_VOTES = 2
+        const val LDPC_MAX_ITERATIONS = 18
+        const val PARITY_MISS_COST = 1.0f
+        const val BIT_FLIP_BASE_COST = 0.06f
+        const val BIT_FLIP_RELIABILITY_COST = 1.10f
+        const val MIN_COST_IMPROVEMENT = 0.01f
+        const val DEFAULT_HARD_BIT_RELIABILITY = 0.75f
+        const val ERASURE_SOLVE_RELIABILITY_SCALE = 0.62f
+        const val MAX_SOLVED_ERASURE_RELIABILITY = 0.45f
         const val TIMING_WINDOW_SIZE = 90
         const val NOTICE_VISIBLE_MS = 3_200L
         const val NOTICE_EXIT_MS = 420L

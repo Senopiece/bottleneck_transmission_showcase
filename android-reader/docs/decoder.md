@@ -72,7 +72,13 @@ The visible decode progress starts on `01010`, not on idle zeros. Progress inclu
 
 If marker detection is lost during the active payload phase, the clock does not immediately abort. It continues ticking by time and emits erasure packets for symbol windows that could not be sampled. Camera/app stream interruption is still treated as a hard failure.
 
-During the active phase the emitted packet is not sampled from a single frame at the period boundary. The decoder accumulates LED scores from the middle of each symbol window and thresholds the average score. This avoids reading exposure tails and transition frames as payload bits.
+During the active phase the emitted packet is not sampled from a single frame at the period boundary. The decoder accumulates LED scores from the middle of each symbol window and emits soft packets:
+
+- confident on -> `1`
+- confident off -> `0`
+- ambiguous transition/noisy bit -> `?`
+
+Each non-erased bit also carries a reliability score into the message decoder. This avoids turning exposure tails and transition frames into hard confident errors.
 
 If a whole symbol period is skipped, or no frame lands inside the middle sampling window, the clock emits an erasure instead of fabricating a packet from a boundary frame.
 
@@ -84,4 +90,4 @@ The virtual device sends a 6x6 binary image as 36 payload bits. The transmitted 
 - 24 low-density parity bits
 - 60 total bits, sent as 12 packets of 5 bits after the four-packet preamble
 
-The Android side first tries to fill erasures from single-unknown parity checks. Then it runs a small iterative bit-flip decoder over the sparse parity checks and displays the first 36 decoded bits as the 6x6 image. If the parity checks still do not converge, no image is emitted; this avoids displaying a confident-looking but shifted or corrupted message.
+The Android side first tries to fill erasures from single-unknown parity checks. Remaining unknowns and weak hard bits are then handled by a weighted parity decoder. It minimizes parity failures plus a flip penalty based on bit reliability, so low-confidence or erased bits are corrected before high-confidence bits. If the parity checks still do not converge, no image is emitted; this avoids displaying a confident-looking but shifted or corrupted message.

@@ -280,7 +280,15 @@
     const CODEWORD_BITS = MESSAGE_BITS + PARITY_BITS;
     const PACKET_BITS = 5;
     const PACKET_COUNT = CODEWORD_BITS / PACKET_BITS;
-    const pixels = new Array(MESSAGE_BITS).fill(false);
+    const DEFAULT_MESSAGE = [
+      "110011",
+      "110011",
+      "000000",
+      "001100",
+      "011110",
+      "010010",
+    ].join("");
+    const pixels = [...DEFAULT_MESSAGE].map((bit) => bit === "1");
 
     let bits = "00000";
     let timer = null;

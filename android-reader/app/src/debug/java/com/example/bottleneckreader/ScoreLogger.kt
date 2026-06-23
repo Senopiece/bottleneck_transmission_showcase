@@ -22,6 +22,18 @@ class ScoreLogger {
             event.bits == null -> "erasure ${event.packetKind ?: "unknown"} $state"
             else -> event.bits + " ${event.packetKind ?: "unknown"} $state"
         }
+        val debugValue = event?.debugInfo?.let { info ->
+            listOf(
+                "periodMs=${String.format(Locale.US, "%.2f", info.periodNs / 1_000_000f)}",
+                "measuredMs=${String.format(Locale.US, "%.2f", info.measuredPeriodNs / 1_000_000f)}",
+                "late=${info.periodsElapsed}",
+                "samples=${info.sampleCount}",
+                "weight=${String.format(Locale.US, "%.3f", info.sampleWeightSum)}",
+                "avg=${formatArray(info.averages)}",
+                "peak=${formatArray(info.peaks)}",
+                "rel=${formatArray(info.reliabilities)}",
+            ).joinToString(separator = " ")
+        }
         val scoreColumns = if (scores == null) {
             ",,,,"
         } else {
@@ -29,8 +41,13 @@ class ScoreLogger {
         }
         Log.d(
             SCORE_CSV_TAG,
-            "$timestampNs,${if (scores == null) 0 else 1},$scoreColumns,$eventValue",
+            "$timestampNs,${if (scores == null) 0 else 1},$scoreColumns,$eventValue${debugValue?.let { " $it" } ?: ""}",
         )
+    }
+
+    private fun formatArray(values: FloatArray): String {
+        if (values.isEmpty()) return "-"
+        return values.joinToString(separator = "|") { String.format(Locale.US, "%.3f", it) }
     }
 
     private companion object {

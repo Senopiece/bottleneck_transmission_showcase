@@ -3,8 +3,21 @@ package com.example.bottleneckreader
 class PacketClockDecoder {
     data class Result(
         val bits: String? = null,
+        val bitReliability: FloatArray? = null,
+        val debugInfo: DebugInfo? = null,
         val packetKind: PacketKind? = null,
         val failure: FailureReason? = null,
+    )
+
+    data class DebugInfo(
+        val periodNs: Long = 0L,
+        val measuredPeriodNs: Long = 0L,
+        val periodsElapsed: Long = 0L,
+        val sampleCount: Int = 0,
+        val sampleWeightSum: Float = 0f,
+        val averages: FloatArray = FloatArray(0),
+        val peaks: FloatArray = FloatArray(0),
+        val reliabilities: FloatArray = FloatArray(0),
     )
 
     enum class PacketKind {
@@ -47,6 +60,7 @@ class PacketClockDecoder {
     private var bitStates: BooleanArray? = null
     private val symbolScoreSums = FloatArray(BIT_COUNT)
     private val symbolScoreMax = FloatArray(BIT_COUNT)
+    private var symbolWeightSum = 0f
     private var symbolSampleCount = 0
 
     fun accept(timestampNs: Long, scores: FloatArray?): Result? {
@@ -109,20 +123,25 @@ class PacketClockDecoder {
                 }
                 lastPreambleAtNs = timestampNs
                 preambleIndex += 1
-                val result = Result(bits = expected, packetKind = PacketKind.Preamble)
+                var debugInfo: DebugInfo? = null
 
                 if (preambleIndex == PREAMBLE.size) {
-                    periodNs = if (periodSamples > 0) {
+                    val measuredPeriodNs = if (periodSamples > 0) {
                         (periodSumNs / periodSamples).coerceIn(MIN_PERIOD_NS, MAX_PERIOD_NS)
                     } else {
                         DEFAULT_PERIOD_NS
                     }
+                    periodNs = stabilizeMeasuredPeriod(measuredPeriodNs)
+                    debugInfo = DebugInfo(
+                        periodNs = periodNs,
+                        measuredPeriodNs = measuredPeriodNs,
+                    )
                     symbolStartNs = timestampNs + periodNs
                     nextEmitAtNs = symbolStartNs + periodNs
                     clearSymbolSamples()
                     phase = Phase.Active
                 }
-                result
+                Result(bits = expected, debugInfo = debugInfo, packetKind = PacketKind.Preamble)
             }
             matches(packet, previous) -> null
             packet == ZERO_PACKET -> {
@@ -139,6 +158,13 @@ class PacketClockDecoder {
         return Result(failure = FailureReason.PreambleLost)
     }
 
+    private fun stabilizeMeasuredPeriod(measuredPeriodNs: Long): Long {
+        if (measuredPeriodNs > FAST_PREAMBLE_PERIOD_NS) return measuredPeriodNs
+        return (measuredPeriodNs * FAST_PREAMBLE_PERIOD_SCALE)
+            .toLong()
+            .coerceIn(MIN_PERIOD_NS, MAX_PERIOD_NS)
+    }
+
     private fun acceptActive(scores: FloatArray?, timestampNs: Long): Result? {
         if (timestampNs < nextEmitAtNs) {
             if (scores != null) sampleActiveSymbol(scores, timestampNs)
@@ -146,8 +172,16 @@ class PacketClockDecoder {
         }
 
         val periodsElapsed = ((timestampNs - nextEmitAtNs) / periodNs).coerceAtLeast(0L)
+        val packet = if (periodsElapsed > 0L || symbolSampleCount == 0) null else symbolPacket()
         val result = Result(
-            bits = if (periodsElapsed > 0L || symbolSampleCount == 0) null else symbolPacket(),
+            bits = packet?.bits,
+            bitReliability = packet?.bitReliability,
+            debugInfo = packet?.debugInfo ?: DebugInfo(
+                periodNs = periodNs,
+                periodsElapsed = periodsElapsed,
+                sampleCount = symbolSampleCount,
+                sampleWeightSum = symbolWeightSum,
+            ),
             packetKind = PacketKind.Payload,
         )
         val emittedBoundaryNs = nextEmitAtNs
@@ -162,38 +196,91 @@ class PacketClockDecoder {
         val elapsed = timestampNs - symbolStartNs
         if (elapsed < 0L || elapsed >= periodNs) return
         val phaseInSymbol = elapsed.toFloat() / periodNs.toFloat()
-        if (phaseInSymbol < SYMBOL_SAMPLE_START || phaseInSymbol > SYMBOL_SAMPLE_END) return
+        val sampleWeight = symbolSampleWeight(phaseInSymbol)
+        if (sampleWeight <= 0f) return
 
         for (index in 0 until BIT_COUNT) {
             val score = scores[index]
-            symbolScoreSums[index] += score
+            symbolScoreSums[index] += score * sampleWeight
             if (score > symbolScoreMax[index]) {
                 symbolScoreMax[index] = score
             }
         }
+        symbolWeightSum += sampleWeight
         symbolSampleCount += 1
     }
 
-    private fun symbolPacket(): String {
-        return buildString(BIT_COUNT) {
+    private fun symbolSampleWeight(phaseInSymbol: Float): Float {
+        val edgeLimit = sampleEdgeLimit()
+        val distanceFromCenter = kotlin.math.abs(phaseInSymbol - 0.5f)
+        if (distanceFromCenter >= edgeLimit) return 0f
+        val normalized = 1f - distanceFromCenter / edgeLimit
+        return normalized * normalized
+    }
+
+    private fun sampleEdgeLimit(): Float {
+        return when {
+            periodNs <= FAST_PERIOD_NS -> FAST_SYMBOL_EDGE_LIMIT
+            periodNs <= MEDIUM_PERIOD_NS -> MEDIUM_SYMBOL_EDGE_LIMIT
+            else -> SLOW_SYMBOL_EDGE_LIMIT
+        }
+    }
+
+    private fun symbolPacket(): SymbolPacket {
+        val reliabilities = FloatArray(BIT_COUNT)
+        val averages = FloatArray(BIT_COUNT)
+        val peaks = symbolScoreMax.copyOf()
+        val bits = buildString(BIT_COUNT) {
             for (index in 0 until BIT_COUNT) {
-                val average = symbolScoreSums[index] / symbolSampleCount
+                val average = symbolScoreSums[index] / symbolWeightSum
                 val peak = symbolScoreMax[index]
-                append(
-                    when {
-                        average >= SYMBOL_ON_THRESHOLD -> '1'
-                        peak >= SYMBOL_STRONG_ON_THRESHOLD && average >= SYMBOL_WEAK_ON_AVERAGE -> '1'
-                        average <= SYMBOL_OFF_THRESHOLD && peak <= SYMBOL_OFF_PEAK_LIMIT -> '0'
-                        else -> '?'
-                    },
-                )
+                averages[index] = average
+                val bit = when {
+                    average >= SYMBOL_ON_THRESHOLD -> '1'
+                    peak >= SYMBOL_STRONG_ON_THRESHOLD && average >= SYMBOL_WEAK_ON_AVERAGE -> '1'
+                    average <= SYMBOL_OFF_THRESHOLD && peak <= SYMBOL_OFF_PEAK_LIMIT -> '0'
+                    else -> '?'
+                }
+                reliabilities[index] = bitReliability(bit, average, peak)
+                append(bit)
             }
+        }
+        return SymbolPacket(
+            bits = bits,
+            bitReliability = reliabilities,
+            debugInfo = DebugInfo(
+                periodNs = periodNs,
+                sampleCount = symbolSampleCount,
+                sampleWeightSum = symbolWeightSum,
+                averages = averages,
+                peaks = peaks,
+                reliabilities = reliabilities.copyOf(),
+            ),
+        )
+    }
+
+    private fun bitReliability(bit: Char, average: Float, peak: Float): Float {
+        return when (bit) {
+            '1' -> {
+                val avgConfidence = ((average - SYMBOL_WEAK_ON_AVERAGE) / (SYMBOL_STRONG_ON_THRESHOLD - SYMBOL_WEAK_ON_AVERAGE))
+                    .coerceIn(0f, 1f)
+                val peakConfidence = ((peak - SYMBOL_ON_THRESHOLD) / (SYMBOL_STRONG_ON_THRESHOLD - SYMBOL_ON_THRESHOLD))
+                    .coerceIn(0f, 1f)
+                (0.35f + 0.45f * avgConfidence + 0.20f * peakConfidence).coerceIn(0f, 1f)
+            }
+            '0' -> {
+                val avgConfidence = ((SYMBOL_OFF_THRESHOLD - average) / SYMBOL_OFF_THRESHOLD).coerceIn(0f, 1f)
+                val peakConfidence = ((SYMBOL_OFF_PEAK_LIMIT - peak) / SYMBOL_OFF_PEAK_LIMIT).coerceIn(0f, 1f)
+                (0.25f + 0.50f * avgConfidence + 0.25f * peakConfidence).coerceIn(0f, 1f)
+            }
+            else -> 0f
         }
     }
 
     private fun clearSymbolSamples() {
         java.util.Arrays.fill(symbolScoreSums, 0f)
         java.util.Arrays.fill(symbolScoreMax, Float.NEGATIVE_INFINITY)
+        symbolWeightSum = 0f
         symbolSampleCount = 0
     }
 
@@ -251,6 +338,12 @@ class PacketClockDecoder {
         return true
     }
 
+    private data class SymbolPacket(
+        val bits: String,
+        val bitReliability: FloatArray,
+        val debugInfo: DebugInfo,
+    )
+
     private companion object {
         const val BIT_COUNT = 5
         const val REQUIRED_ZERO_FRAMES = 3
@@ -265,8 +358,13 @@ class PacketClockDecoder {
         const val SYMBOL_WEAK_ON_AVERAGE = 0.72f
         const val SYMBOL_OFF_THRESHOLD = 0.56f
         const val SYMBOL_OFF_PEAK_LIMIT = 0.86f
-        const val SYMBOL_SAMPLE_START = 0.22f
-        const val SYMBOL_SAMPLE_END = 0.82f
+        const val FAST_PERIOD_NS = 135_000_000L
+        const val FAST_PREAMBLE_PERIOD_NS = 145_000_000L
+        const val FAST_PREAMBLE_PERIOD_SCALE = 1.07f
+        const val MEDIUM_PERIOD_NS = 180_000_000L
+        const val FAST_SYMBOL_EDGE_LIMIT = 0.38f
+        const val MEDIUM_SYMBOL_EDGE_LIMIT = 0.42f
+        const val SLOW_SYMBOL_EDGE_LIMIT = 0.46f
         const val DEFAULT_PERIOD_NS = 125_000_000L
         const val MIN_PERIOD_NS = 33_000_000L
         const val MAX_PERIOD_NS = 1_000_000_000L
