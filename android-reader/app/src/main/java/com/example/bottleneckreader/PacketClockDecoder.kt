@@ -51,8 +51,8 @@ class PacketClockDecoder {
     private var preambleIndex = 1
     private var preambleStarted = false
     private var lastPreambleAtNs = 0L
-    private var periodSumNs = 0L
-    private var periodSamples = 0
+    private val preambleIntervalsNs = LongArray(PREAMBLE.size - 2)
+    private var preambleIntervalCount = 0
     private var preambleMisses = 0
     private var periodNs = DEFAULT_PERIOD_NS
     private var symbolStartNs = 0L
@@ -117,26 +117,32 @@ class PacketClockDecoder {
             matches(packet, expected) -> {
                 preambleMisses = 0
                 preambleStarted = true
+                var lastIntervalNs = 0L
                 if (lastPreambleAtNs != 0L) {
-                    periodSumNs += timestampNs - lastPreambleAtNs
-                    periodSamples += 1
+                    lastIntervalNs = timestampNs - lastPreambleAtNs
+                    if (preambleIntervalCount < preambleIntervalsNs.size) {
+                        preambleIntervalsNs[preambleIntervalCount] = lastIntervalNs
+                        preambleIntervalCount += 1
+                    }
                 }
+                val previousPreambleAtNs = lastPreambleAtNs
                 lastPreambleAtNs = timestampNs
                 preambleIndex += 1
                 var debugInfo: DebugInfo? = null
 
                 if (preambleIndex == PREAMBLE.size) {
-                    val measuredPeriodNs = if (periodSamples > 0) {
-                        (periodSumNs / periodSamples).coerceIn(MIN_PERIOD_NS, MAX_PERIOD_NS)
-                    } else {
-                        DEFAULT_PERIOD_NS
-                    }
+                    val measuredPeriodNs = estimatePreamblePeriod()
                     periodNs = stabilizeMeasuredPeriod(measuredPeriodNs)
+                    val finalPreambleAtNs = correctedFinalPreambleAt(
+                        observedFinalAtNs = timestampNs,
+                        previousPreambleAtNs = previousPreambleAtNs,
+                        lastIntervalNs = lastIntervalNs,
+                    )
                     debugInfo = DebugInfo(
                         periodNs = periodNs,
                         measuredPeriodNs = measuredPeriodNs,
                     )
-                    symbolStartNs = timestampNs + periodNs
+                    symbolStartNs = finalPreambleAtNs + periodNs
                     nextEmitAtNs = symbolStartNs + periodNs
                     clearSymbolSamples()
                     phase = Phase.Active
@@ -163,6 +169,39 @@ class PacketClockDecoder {
         return (measuredPeriodNs * FAST_PREAMBLE_PERIOD_SCALE)
             .toLong()
             .coerceIn(MIN_PERIOD_NS, MAX_PERIOD_NS)
+    }
+
+    private fun estimatePreamblePeriod(): Long {
+        if (preambleIntervalCount == 0) return DEFAULT_PERIOD_NS
+        if (preambleIntervalCount == 1) {
+            return preambleIntervalsNs[0].coerceIn(MIN_PERIOD_NS, MAX_PERIOD_NS)
+        }
+
+        val first = preambleIntervalsNs[0]
+        val second = preambleIntervalsNs[1]
+        val longer = kotlin.math.max(first, second)
+        val shorter = kotlin.math.min(first, second)
+        val measured = if (shorter * 100L < longer * SHORT_PREAMBLE_INTERVAL_PERCENT) {
+            // The all-on final preamble can be observed early during camera exposure overlap.
+            // In that case the longer interval is a better period estimate than the average.
+            (longer * EARLY_FINAL_PERIOD_SCALE).toLong()
+        } else {
+            (first + second) / 2L
+        }
+        return measured.coerceIn(MIN_PERIOD_NS, MAX_PERIOD_NS)
+    }
+
+    private fun correctedFinalPreambleAt(
+        observedFinalAtNs: Long,
+        previousPreambleAtNs: Long,
+        lastIntervalNs: Long,
+    ): Long {
+        if (previousPreambleAtNs == 0L || lastIntervalNs == 0L) return observedFinalAtNs
+        return if (lastIntervalNs * 100L < periodNs * EARLY_FINAL_ANCHOR_PERCENT) {
+            previousPreambleAtNs + periodNs
+        } else {
+            observedFinalAtNs
+        }
     }
 
     private fun acceptActive(scores: FloatArray?, timestampNs: Long): Result? {
@@ -299,8 +338,8 @@ class PacketClockDecoder {
         preambleIndex = 1
         preambleStarted = false
         lastPreambleAtNs = 0L
-        periodSumNs = 0L
-        periodSamples = 0
+        java.util.Arrays.fill(preambleIntervalsNs, 0L)
+        preambleIntervalCount = 0
         preambleMisses = 0
     }
 
@@ -361,6 +400,9 @@ class PacketClockDecoder {
         const val FAST_PERIOD_NS = 135_000_000L
         const val FAST_PREAMBLE_PERIOD_NS = 145_000_000L
         const val FAST_PREAMBLE_PERIOD_SCALE = 1.07f
+        const val SHORT_PREAMBLE_INTERVAL_PERCENT = 62L
+        const val EARLY_FINAL_PERIOD_SCALE = 0.88f
+        const val EARLY_FINAL_ANCHOR_PERCENT = 88L
         const val MEDIUM_PERIOD_NS = 180_000_000L
         const val FAST_SYMBOL_EDGE_LIMIT = 0.38f
         const val MEDIUM_SYMBOL_EDGE_LIMIT = 0.42f

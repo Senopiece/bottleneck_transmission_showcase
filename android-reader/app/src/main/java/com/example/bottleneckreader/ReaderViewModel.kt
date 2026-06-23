@@ -323,8 +323,100 @@ class ReaderViewModel : ViewModel() {
                 }
             }
         }
+        val bpDecoded = decodeMinSumCodeword(codeword, bitReliability)
+        if (bpDecoded != null) return bpDecoded
+
         solveErasures(bits, known, bitReliability)
         return decodeWeightedCodeword(bits, bitReliability)
+    }
+
+    private fun decodeMinSumCodeword(codeword: String, reliability: FloatArray): BooleanArray? {
+        val channel = Array(PARITY_BITS) { FloatArray(CHECK_DEGREE) }
+        val checkToVariable = Array(PARITY_BITS) { FloatArray(CHECK_DEGREE) }
+        val posterior = FloatArray(CODEWORD_BITS)
+
+        for (check in 0 until PARITY_BITS) {
+            val indexes = LDPC_CHECK_INDEXES[check]
+            for (edge in 0 until CHECK_DEGREE) {
+                channel[check][edge] = initialLlr(codeword[indexes[edge]], reliability.getOrElse(indexes[edge]) { 0f })
+            }
+        }
+
+        repeat(BP_MAX_ITERATIONS) { iteration ->
+            for (check in 0 until PARITY_BITS) {
+                val variableToCheck = channel[check]
+                for (edge in 0 until CHECK_DEGREE) {
+                    var sign = 1f
+                    var minMagnitude = Float.POSITIVE_INFINITY
+                    for (otherEdge in 0 until CHECK_DEGREE) {
+                        if (otherEdge == edge) continue
+                        val message = variableToCheck[otherEdge]
+                        if (message < 0f) sign = -sign
+                        val magnitude = kotlin.math.abs(message)
+                        if (magnitude < minMagnitude) minMagnitude = magnitude
+                    }
+                    checkToVariable[check][edge] = sign * minMagnitude * BP_NORMALIZATION
+                }
+            }
+
+            java.util.Arrays.fill(posterior, 0f)
+            for (index in 0 until CODEWORD_BITS) {
+                posterior[index] = initialLlr(codeword[index], reliability.getOrElse(index) { 0f })
+            }
+            for (check in 0 until PARITY_BITS) {
+                val indexes = LDPC_CHECK_INDEXES[check]
+                for (edge in 0 until CHECK_DEGREE) {
+                    posterior[indexes[edge]] += checkToVariable[check][edge]
+                }
+            }
+
+            val bits = BooleanArray(CODEWORD_BITS) { index -> posterior[index] < 0f }
+            if (parityMissCount(bits) == 0) {
+                logDebug("bp decoded iterations=${iteration + 1}")
+                return bits
+            }
+
+            for (check in 0 until PARITY_BITS) {
+                val indexes = LDPC_CHECK_INDEXES[check]
+                for (edge in 0 until CHECK_DEGREE) {
+                    channel[check][edge] = (
+                        initialLlr(codeword[indexes[edge]], reliability.getOrElse(indexes[edge]) { 0f }) +
+                            variableCheckSum(indexes[edge], check, checkToVariable)
+                        ).coerceIn(-BP_MAX_LLR, BP_MAX_LLR)
+                }
+            }
+        }
+
+        logDebug("bp failed syndrome=${parityMissCount(BooleanArray(CODEWORD_BITS) { posterior[it] < 0f })}")
+        return null
+    }
+
+    private fun initialLlr(bit: Char, reliability: Float): Float {
+        val magnitude = (BP_BASE_LLR + reliability.coerceIn(0f, 1f) * BP_RELIABILITY_LLR).coerceAtMost(BP_MAX_LLR)
+        return when (bit) {
+            '0' -> magnitude
+            '1' -> -magnitude
+            else -> 0f
+        }
+    }
+
+    private fun variableCheckSum(
+        variableIndex: Int,
+        excludedCheck: Int,
+        checkToVariable: Array<FloatArray>,
+    ): Float {
+        var sum = 0f
+        for (check in 0 until PARITY_BITS) {
+            if (check == excludedCheck) continue
+            val indexes = LDPC_CHECK_INDEXES[check]
+            for (edge in 0 until CHECK_DEGREE) {
+                if (indexes[edge] == variableIndex) {
+                    sum += checkToVariable[check][edge]
+                    break
+                }
+            }
+        }
+        return sum
     }
 
     private fun solveErasures(bits: BooleanArray, known: BooleanArray, reliability: FloatArray) {
@@ -439,6 +531,12 @@ class ReaderViewModel : ViewModel() {
         const val CODEWORD_BITS = MESSAGE_BITS + PARITY_BITS
         const val MESSAGE_PACKET_COUNT = CODEWORD_BITS / LED_COUNT
         const val TOTAL_PROGRESS_PACKETS = PREAMBLE_PROGRESS_PACKETS + MESSAGE_PACKET_COUNT
+        const val CHECK_DEGREE = 5
+        const val BP_MAX_ITERATIONS = 16
+        const val BP_NORMALIZATION = 0.82f
+        const val BP_BASE_LLR = 0.16f
+        const val BP_RELIABILITY_LLR = 2.80f
+        const val BP_MAX_LLR = 6.0f
         const val LDPC_MAX_ITERATIONS = 18
         const val PARITY_MISS_COST = 1.0f
         const val BIT_FLIP_BASE_COST = 0.06f
@@ -462,6 +560,11 @@ class ReaderViewModel : ViewModel() {
                 (index * 5 + 13) % MESSAGE_BITS,
                 (index * 5 + 23) % MESSAGE_BITS,
             )
+        }
+
+        val LDPC_CHECK_INDEXES: Array<IntArray> = Array(PARITY_BITS) { check ->
+            val group = LDPC_GROUPS[check]
+            intArrayOf(group[0], group[1], group[2], group[3], MESSAGE_BITS + check)
         }
     }
 }
