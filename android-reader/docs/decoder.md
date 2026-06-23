@@ -70,6 +70,8 @@ The packet clock has four phases:
 
 The visible decode progress starts on `01010`, not on idle zeros. Progress includes the three visible preamble packets plus the twelve payload packets.
 
+At high rates the camera exposure can make the last all-on preamble appear early while the previous transition appears late. A long/short preamble interval pair around `166ms/100ms` is treated as an exposure-overlap case and mapped back to a fast stream period near `125ms` instead of being accepted as a slower `146ms` stream.
+
 If marker detection is lost during the active payload phase, the clock does not immediately abort. It continues ticking by time and emits erasure packets for symbol windows that could not be sampled. Camera/app stream interruption is still treated as a hard failure.
 
 During the active phase the emitted packet is not sampled from a single frame at the period boundary. The decoder accumulates LED scores from the middle of each symbol window and emits soft packets:
@@ -80,6 +82,10 @@ During the active phase the emitted packet is not sampled from a single frame at
 
 Each non-erased bit also carries a reliability score into the message decoder. This avoids turning exposure tails and transition frames into hard confident errors.
 
+At fast periods, a single high peak is not enough to produce a hard `1` unless the weighted average for the symbol is also high. This makes the decoder prefer `?` over a confident false `1` when the camera sees a short exposure tail from the previous bright symbol.
+
+Fast streams also use a stricter average threshold for hard `1` decisions. A bit that only reaches the normal threshold but not the fast threshold is treated as ambiguous, because the logs show those mid-level samples are usually timing/exposure overlap after a previous bright packet.
+
 If a whole symbol period is skipped, or no frame lands inside the middle sampling window, the clock emits an erasure instead of fabricating a packet from a boundary frame.
 
 ## Message Codeword
@@ -87,7 +93,11 @@ If a whole symbol period is skipped, or no frame lands inside the middle samplin
 The virtual device sends a 6x6 binary image as 36 payload bits. The transmitted message is a systematic sparse parity codeword:
 
 - 36 payload bits
-- 24 low-density parity bits
+- 24 sparse parity bits
 - 60 total bits, sent as 12 packets of 5 bits after the four-packet preamble
 
-The Android side first tries to fill erasures from single-unknown parity checks. Remaining unknowns and weak hard bits are then handled by a weighted parity decoder. It minimizes parity failures plus a flip penalty based on bit reliability, so low-confidence or erased bits are corrected before high-confidence bits. If the parity checks still do not converge, no image is emitted; this avoids displaying a confident-looking but shifted or corrupted message.
+Each parity bit checks 8 payload bits. The parity matrix is fixed and balanced so every payload bit participates in 5-6 checks. This is still a lightweight systematic codeword, but it is less likely to accept a phase-shifted payload as another valid message than the older 4-input parity layout.
+
+The Android side uses a soft normalized min-sum LDPC pass first. A decoded codeword is accepted only if it stays close to the actually observed hard bits; correcting erasures is fine, but flipping reliable known bits is treated as evidence of a timing/phase error and the decode is rejected. The pass has a fixed iteration budget and is still cheap compared with camera tracking.
+
+If belief propagation fails, the decoder fills erasures from single-unknown parity checks. It then tries an exact GF(2) linear solve for the remaining erasures and only accepts a unique solution that does not flip known bits. The older weighted flip fallback is now restricted to very small erasure cases and is not allowed to flip known bits. If the input has too many erasures, too many fully missing packets, or requires changing observed bits, no image is emitted.

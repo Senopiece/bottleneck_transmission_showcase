@@ -181,7 +181,14 @@ class PacketClockDecoder {
         val second = preambleIntervalsNs[1]
         val longer = kotlin.math.max(first, second)
         val shorter = kotlin.math.min(first, second)
-        val measured = if (shorter * 100L < longer * SHORT_PREAMBLE_INTERVAL_PERCENT) {
+        val measured = if (
+            longer in FAST_ASYMMETRIC_LONG_MIN_NS..FAST_ASYMMETRIC_LONG_MAX_NS &&
+            shorter in FAST_ASYMMETRIC_SHORT_MIN_NS..FAST_ASYMMETRIC_SHORT_MAX_NS
+        ) {
+            // At high rates the 11111 preamble often appears early while the previous edge
+            // appears late, producing a long/short pair such as 166ms/100ms for a 125ms stream.
+            (((first + second) / 2L) * FAST_ASYMMETRIC_INTERVAL_SCALE).toLong()
+        } else if (shorter * 100L < longer * SHORT_PREAMBLE_INTERVAL_PERCENT) {
             // The all-on final preamble can be observed early during camera exposure overlap.
             // In that case the longer interval is a better period estimate than the average.
             (longer * EARLY_FINAL_PERIOD_SCALE).toLong()
@@ -269,18 +276,20 @@ class PacketClockDecoder {
         val reliabilities = FloatArray(BIT_COUNT)
         val averages = FloatArray(BIT_COUNT)
         val peaks = symbolScoreMax.copyOf()
+        val onThreshold = onThreshold()
+        val weakOnAverage = weakOnAverageThreshold()
         val bits = buildString(BIT_COUNT) {
             for (index in 0 until BIT_COUNT) {
                 val average = symbolScoreSums[index] / symbolWeightSum
                 val peak = symbolScoreMax[index]
                 averages[index] = average
                 val bit = when {
-                    average >= SYMBOL_ON_THRESHOLD -> '1'
-                    peak >= SYMBOL_STRONG_ON_THRESHOLD && average >= SYMBOL_WEAK_ON_AVERAGE -> '1'
+                    average >= onThreshold -> '1'
+                    peak >= SYMBOL_STRONG_ON_THRESHOLD && average >= weakOnAverage -> '1'
                     average <= SYMBOL_OFF_THRESHOLD && peak <= SYMBOL_OFF_PEAK_LIMIT -> '0'
                     else -> '?'
                 }
-                reliabilities[index] = bitReliability(bit, average, peak)
+                reliabilities[index] = bitReliability(bit, average, peak, onThreshold, weakOnAverage)
                 append(bit)
             }
         }
@@ -298,12 +307,20 @@ class PacketClockDecoder {
         )
     }
 
-    private fun bitReliability(bit: Char, average: Float, peak: Float): Float {
+    private fun onThreshold(): Float {
+        return if (periodNs <= FAST_PERIOD_NS) FAST_SYMBOL_ON_THRESHOLD else SYMBOL_ON_THRESHOLD
+    }
+
+    private fun weakOnAverageThreshold(): Float {
+        return if (periodNs <= FAST_PERIOD_NS) FAST_SYMBOL_WEAK_ON_AVERAGE else SYMBOL_WEAK_ON_AVERAGE
+    }
+
+    private fun bitReliability(bit: Char, average: Float, peak: Float, onThreshold: Float, weakOnAverage: Float): Float {
         return when (bit) {
             '1' -> {
-                val avgConfidence = ((average - SYMBOL_WEAK_ON_AVERAGE) / (SYMBOL_STRONG_ON_THRESHOLD - SYMBOL_WEAK_ON_AVERAGE))
+                val avgConfidence = ((average - weakOnAverage) / (SYMBOL_STRONG_ON_THRESHOLD - weakOnAverage))
                     .coerceIn(0f, 1f)
-                val peakConfidence = ((peak - SYMBOL_ON_THRESHOLD) / (SYMBOL_STRONG_ON_THRESHOLD - SYMBOL_ON_THRESHOLD))
+                val peakConfidence = ((peak - onThreshold) / (SYMBOL_STRONG_ON_THRESHOLD - onThreshold))
                     .coerceIn(0f, 1f)
                 (0.35f + 0.45f * avgConfidence + 0.20f * peakConfidence).coerceIn(0f, 1f)
             }
@@ -393,13 +410,20 @@ class PacketClockDecoder {
         const val ON_THRESHOLD = 1.0f
         const val OFF_THRESHOLD = 0.6f
         const val SYMBOL_ON_THRESHOLD = 0.94f
+        const val FAST_SYMBOL_ON_THRESHOLD = 1.05f
         const val SYMBOL_STRONG_ON_THRESHOLD = 1.12f
         const val SYMBOL_WEAK_ON_AVERAGE = 0.72f
+        const val FAST_SYMBOL_WEAK_ON_AVERAGE = 1.05f
         const val SYMBOL_OFF_THRESHOLD = 0.56f
         const val SYMBOL_OFF_PEAK_LIMIT = 0.86f
         const val FAST_PERIOD_NS = 135_000_000L
         const val FAST_PREAMBLE_PERIOD_NS = 145_000_000L
         const val FAST_PREAMBLE_PERIOD_SCALE = 1.07f
+        const val FAST_ASYMMETRIC_INTERVAL_SCALE = 0.875f
+        const val FAST_ASYMMETRIC_LONG_MIN_NS = 150_000_000L
+        const val FAST_ASYMMETRIC_LONG_MAX_NS = 180_000_000L
+        const val FAST_ASYMMETRIC_SHORT_MIN_NS = 85_000_000L
+        const val FAST_ASYMMETRIC_SHORT_MAX_NS = 120_000_000L
         const val SHORT_PREAMBLE_INTERVAL_PERCENT = 62L
         const val EARLY_FINAL_PERIOD_SCALE = 0.88f
         const val EARLY_FINAL_ANCHOR_PERCENT = 88L

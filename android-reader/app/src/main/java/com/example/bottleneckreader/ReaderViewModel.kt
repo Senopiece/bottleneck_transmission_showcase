@@ -209,8 +209,16 @@ class ReaderViewModel : ViewModel() {
         if (messagePackets.size < MESSAGE_PACKET_COUNT) return
         val codeword = messagePackets.joinToString(separator = "") { it ?: ERASURE_PACKET }
         if (codeword.length < CODEWORD_BITS) return
-        logDebug("decode codeword erasures=${codeword.count { it == '?' }} codeword=$codeword")
-        val decoded = decodeSparseParityCodeword(codeword, flattenReliability())
+        val erasureBits = codeword.count { it == '?' }
+        val erasurePackets = messagePackets.count { it == null }
+        val reliability = flattenReliability()
+        logDebug("decode codeword erasures=$erasureBits packets=$erasurePackets codeword=$codeword")
+        if (erasureBits > MAX_DECODE_ERASURE_BITS || erasurePackets > MAX_DECODE_ERASURE_PACKETS) {
+            failProgress("Decode failed: insufficient reliable packets")
+            logDebug("message decode rejected: erasures=$erasureBits packets=$erasurePackets")
+            return
+        }
+        val decoded = decodeSparseParityCodeword(codeword, reliability)
         if (decoded == null) {
             failProgress("Decode failed: parity checks did not converge")
             logDebug("message decode failed: parity checks did not converge")
@@ -324,10 +332,47 @@ class ReaderViewModel : ViewModel() {
             }
         }
         val bpDecoded = decodeMinSumCodeword(codeword, bitReliability)
-        if (bpDecoded != null) return bpDecoded
+        if (bpDecoded != null) {
+            val cost = decodedInputCost(bpDecoded, codeword, bitReliability)
+            if (cost.knownFlips <= BP_MAX_ACCEPT_KNOWN_FLIPS && cost.weightedCost <= BP_MAX_ACCEPT_FLIP_COST) {
+                return bpDecoded
+            }
+            logDebug("bp rejected flips=${cost.knownFlips} cost=${cost.weightedCost}")
+        }
 
         solveErasures(bits, known, bitReliability)
-        return decodeWeightedCodeword(bits, bitReliability)
+        if (parityMissCount(bits) == 0) {
+            val erasureSolvedCost = decodedInputCost(bits, codeword, bitReliability)
+            if (erasureSolvedCost.knownFlips == 0) {
+                logDebug("erasures solved without known flips")
+                return bits
+            }
+        }
+        if (solveErasureSystem(bits, known, bitReliability)) {
+            val erasureSolvedCost = decodedInputCost(bits, codeword, bitReliability)
+            if (erasureSolvedCost.knownFlips == 0) {
+                logDebug("erasure system solved")
+                return bits
+            }
+        }
+
+        val erasureBits = codeword.count { it == '?' }
+        if (erasureBits > FALLBACK_MAX_ERASURE_BITS) {
+            logDebug("fallback skipped erasures=$erasureBits")
+            return null
+        }
+
+        val fallbackDecoded = decodeWeightedCodeword(bits, bitReliability) ?: return null
+        val fallbackCost = decodedInputCost(fallbackDecoded, codeword, bitReliability)
+        return if (
+            fallbackCost.knownFlips <= FALLBACK_MAX_ACCEPT_KNOWN_FLIPS &&
+            fallbackCost.weightedCost <= FALLBACK_MAX_ACCEPT_FLIP_COST
+        ) {
+            fallbackDecoded
+        } else {
+            logDebug("fallback rejected flips=${fallbackCost.knownFlips} cost=${fallbackCost.weightedCost}")
+            null
+        }
     }
 
     private fun decodeMinSumCodeword(codeword: String, reliability: FloatArray): BooleanArray? {
@@ -451,6 +496,85 @@ class ReaderViewModel : ViewModel() {
         } while (changed)
     }
 
+    private fun solveErasureSystem(bits: BooleanArray, known: BooleanArray, reliability: FloatArray): Boolean {
+        val unknownIndexes = IntArray(CODEWORD_BITS)
+        var unknownCount = 0
+        for (index in 0 until CODEWORD_BITS) {
+            if (!known[index]) {
+                unknownIndexes[unknownCount] = index
+                unknownCount += 1
+            }
+        }
+        if (unknownCount == 0) return parityMissCount(bits) == 0
+        if (unknownCount > MAX_LINEAR_ERASURE_BITS) return false
+
+        val unknownColumn = IntArray(CODEWORD_BITS) { -1 }
+        for (column in 0 until unknownCount) {
+            unknownColumn[unknownIndexes[column]] = column
+        }
+
+        val rows = LongArray(PARITY_BITS)
+        var rowCount = 0
+        for (check in 0 until PARITY_BITS) {
+            val indexes = LDPC_CHECK_INDEXES[check]
+            var mask = 0L
+            var rhs = false
+            for (index in indexes) {
+                val column = unknownColumn[index]
+                if (column >= 0) {
+                    mask = mask xor (1L shl column)
+                } else {
+                    rhs = rhs != bits[index]
+                }
+            }
+            if (mask != 0L) {
+                rows[rowCount] = mask or (if (rhs) (1L shl unknownCount) else 0L)
+                rowCount += 1
+            } else if (rhs) {
+                return false
+            }
+        }
+
+        var rank = 0
+        for (column in 0 until unknownCount) {
+            var pivot = -1
+            for (row in rank until rowCount) {
+                if (((rows[row] ushr column) and 1L) != 0L) {
+                    pivot = row
+                    break
+                }
+            }
+            if (pivot < 0) continue
+            val tmp = rows[rank]
+            rows[rank] = rows[pivot]
+            rows[pivot] = tmp
+            for (row in 0 until rowCount) {
+                if (row != rank && (((rows[row] ushr column) and 1L) != 0L)) {
+                    rows[row] = rows[row] xor rows[rank]
+                }
+            }
+            rank += 1
+        }
+
+        for (row in rank until rowCount) {
+            val coefficients = rows[row] and ((1L shl unknownCount) - 1L)
+            val rhs = ((rows[row] ushr unknownCount) and 1L) != 0L
+            if (coefficients == 0L && rhs) return false
+        }
+        if (rank < unknownCount) return false
+
+        for (row in 0 until rank) {
+            val coefficients = rows[row] and ((1L shl unknownCount) - 1L)
+            val column = java.lang.Long.numberOfTrailingZeros(coefficients)
+            val value = ((rows[row] ushr unknownCount) and 1L) != 0L
+            val index = unknownIndexes[column]
+            bits[index] = value
+            known[index] = true
+            reliability[index] = SYSTEM_SOLVED_ERASURE_RELIABILITY
+        }
+        return parityMissCount(bits) == 0
+    }
+
     private fun decodeWeightedCodeword(bits: BooleanArray, reliability: FloatArray): BooleanArray? {
         val original = bits.copyOf()
         var currentCost = codewordCost(bits, original, reliability)
@@ -488,6 +612,23 @@ class ReaderViewModel : ViewModel() {
         return cost
     }
 
+    private fun decodedInputCost(decoded: BooleanArray, codeword: String, reliability: FloatArray): DecodeInputCost {
+        var knownFlips = 0
+        var weightedCost = 0f
+        for (index in 0 until CODEWORD_BITS) {
+            val expected = when (codeword[index]) {
+                '0' -> false
+                '1' -> true
+                else -> continue
+            }
+            if (decoded[index] != expected) {
+                knownFlips += 1
+                weightedCost += BIT_FLIP_BASE_COST + reliability[index].coerceIn(0f, 1f) * BIT_FLIP_RELIABILITY_COST
+            }
+        }
+        return DecodeInputCost(knownFlips = knownFlips, weightedCost = weightedCost)
+    }
+
     private fun parityMissCount(bits: BooleanArray): Int {
         var missCount = 0
         for (check in 0 until PARITY_BITS) {
@@ -522,6 +663,11 @@ class ReaderViewModel : ViewModel() {
         }
     }
 
+    private data class DecodeInputCost(
+        val knownFlips: Int,
+        val weightedCost: Float,
+    )
+
     private companion object {
         const val LED_COUNT = 5
         const val MAX_PACKET_EVENTS = 3
@@ -531,12 +677,20 @@ class ReaderViewModel : ViewModel() {
         const val CODEWORD_BITS = MESSAGE_BITS + PARITY_BITS
         const val MESSAGE_PACKET_COUNT = CODEWORD_BITS / LED_COUNT
         const val TOTAL_PROGRESS_PACKETS = PREAMBLE_PROGRESS_PACKETS + MESSAGE_PACKET_COUNT
-        const val CHECK_DEGREE = 5
-        const val BP_MAX_ITERATIONS = 16
+        const val PARITY_DATA_DEGREE = 8
+        const val CHECK_DEGREE = PARITY_DATA_DEGREE + 1
+        const val BP_MAX_ITERATIONS = 32
         const val BP_NORMALIZATION = 0.82f
         const val BP_BASE_LLR = 0.16f
         const val BP_RELIABILITY_LLR = 2.80f
         const val BP_MAX_LLR = 6.0f
+        const val MAX_DECODE_ERASURE_BITS = 20
+        const val MAX_DECODE_ERASURE_PACKETS = 3
+        const val BP_MAX_ACCEPT_KNOWN_FLIPS = 1
+        const val BP_MAX_ACCEPT_FLIP_COST = 1.15f
+        const val FALLBACK_MAX_ERASURE_BITS = 6
+        const val FALLBACK_MAX_ACCEPT_KNOWN_FLIPS = 0
+        const val FALLBACK_MAX_ACCEPT_FLIP_COST = 0.0f
         const val LDPC_MAX_ITERATIONS = 18
         const val PARITY_MISS_COST = 1.0f
         const val BIT_FLIP_BASE_COST = 0.06f
@@ -545,6 +699,8 @@ class ReaderViewModel : ViewModel() {
         const val DEFAULT_HARD_BIT_RELIABILITY = 0.75f
         const val ERASURE_SOLVE_RELIABILITY_SCALE = 0.62f
         const val MAX_SOLVED_ERASURE_RELIABILITY = 0.45f
+        const val MAX_LINEAR_ERASURE_BITS = 24
+        const val SYSTEM_SOLVED_ERASURE_RELIABILITY = 0.35f
         const val TIMING_WINDOW_SIZE = 90
         const val NOTICE_VISIBLE_MS = 3_200L
         const val NOTICE_EXIT_MS = 420L
@@ -553,18 +709,38 @@ class ReaderViewModel : ViewModel() {
         const val DEBUG_TAG = "ReaderDecode"
         const val ERASURE_PACKET = "?????"
 
-        val LDPC_GROUPS: Array<IntArray> = Array(PARITY_BITS) { index ->
-            intArrayOf(
-                (index * 5) % MESSAGE_BITS,
-                (index * 5 + 7) % MESSAGE_BITS,
-                (index * 5 + 13) % MESSAGE_BITS,
-                (index * 5 + 23) % MESSAGE_BITS,
-            )
-        }
+        val LDPC_GROUPS: Array<IntArray> = arrayOf(
+            intArrayOf(15, 34, 8, 23, 30, 20, 18, 2),
+            intArrayOf(0, 5, 26, 22, 32, 19, 7, 9),
+            intArrayOf(17, 35, 33, 24, 28, 11, 10, 25),
+            intArrayOf(27, 9, 14, 12, 6, 16, 13, 4),
+            intArrayOf(7, 16, 3, 1, 20, 31, 24, 15),
+            intArrayOf(4, 27, 21, 18, 0, 1, 29, 28),
+            intArrayOf(34, 26, 12, 2, 16, 10, 33, 29),
+            intArrayOf(11, 19, 13, 8, 25, 21, 14, 1),
+            intArrayOf(30, 0, 23, 31, 24, 6, 32, 35),
+            intArrayOf(13, 17, 28, 12, 31, 3, 22, 23),
+            intArrayOf(21, 10, 9, 20, 5, 25, 29, 3),
+            intArrayOf(17, 32, 20, 14, 18, 6, 33, 2),
+            intArrayOf(18, 10, 22, 6, 11, 4, 26, 3),
+            intArrayOf(15, 12, 5, 4, 19, 24, 35, 34),
+            intArrayOf(3, 8, 35, 26, 7, 27, 25, 23),
+            intArrayOf(5, 25, 31, 32, 27, 11, 1, 30),
+            intArrayOf(29, 22, 0, 17, 33, 8, 30, 14),
+            intArrayOf(28, 15, 7, 31, 2, 8, 11, 9),
+            intArrayOf(27, 19, 34, 17, 20, 21, 0, 6),
+            intArrayOf(5, 7, 30, 10, 13, 6, 1, 23),
+            intArrayOf(5, 28, 16, 12, 22, 2, 21, 32),
+            intArrayOf(33, 13, 26, 4, 25, 15, 24, 29),
+            intArrayOf(10, 19, 32, 18, 3, 15, 35, 16),
+            intArrayOf(31, 13, 21, 17, 35, 34, 9, 14),
+        )
 
         val LDPC_CHECK_INDEXES: Array<IntArray> = Array(PARITY_BITS) { check ->
             val group = LDPC_GROUPS[check]
-            intArrayOf(group[0], group[1], group[2], group[3], MESSAGE_BITS + check)
+            IntArray(CHECK_DEGREE) { edge ->
+                if (edge < PARITY_DATA_DEGREE) group[edge] else MESSAGE_BITS + check
+            }
         }
     }
 }
