@@ -151,8 +151,7 @@
       fill: var(--arrow);
     }
 
-    button,
-    input {
+    button {
       height: 38px;
       border: 1px solid var(--kbd-border);
       border-bottom-color: var(--kbd-border-bottom);
@@ -162,15 +161,26 @@
       font: inherit;
     }
 
-    button {
       padding: 0 12px;
       font-weight: 650;
       cursor: pointer;
     }
 
-    input {
-      width: 100%;
-      padding: 0 10px;
+    button:disabled {
+      cursor: default;
+      opacity: 0.55;
+    }
+
+    .rate-buttons {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 6px;
+    }
+
+    .rate-button[aria-pressed="true"] {
+      border-color: #7c8490;
+      background: #181b20;
+      color: var(--fg);
     }
 
     .compact {
@@ -249,8 +259,12 @@
 
       <section class="controls">
         <div class="compact">
-          <label for="fps">rate</label>
-          <input id="fps" type="number" min="1" max="30" value="4">
+          <label>rate</label>
+          <div class="rate-buttons" role="group" aria-label="rate">
+            <button class="rate-button" type="button" data-rate="2" aria-pressed="false">2</button>
+            <button class="rate-button" type="button" data-rate="4" aria-pressed="false">4</button>
+            <button class="rate-button" type="button" data-rate="8" aria-pressed="true">8</button>
+          </div>
         </div>
 
         <div class="actions">
@@ -269,17 +283,21 @@
 
   <script>
     const leds = [...document.querySelectorAll(".led")];
-    const fps = document.getElementById("fps");
     const play = document.getElementById("play");
+    const rateButtons = [...document.querySelectorAll(".rate-button")];
     const messageGrid = document.getElementById("messageGrid");
     const binaryOut = document.getElementById("binaryOut");
 
+    // ===== FOUNTAIN CODE CONFIGURATION =====
     const PREAMBLE = ["00000", "01010", "10101", "11111"];
     const MESSAGE_BITS = 36;
     const PARITY_BITS = 24;
-    const CODEWORD_BITS = MESSAGE_BITS + PARITY_BITS;
+    const CODEWORD_BITS = MESSAGE_BITS + PARITY_BITS; // 60 bits total from finite LDPC
     const PACKET_BITS = 5;
-    const PACKET_COUNT = CODEWORD_BITS / PACKET_BITS;
+    const MEASUREMENTS_PER_PACKET = 5; // 5 measurements per transmitted packet
+    const SEED1 = 0x12345678; // LDGM RNG seed
+
+    // Finite LDPC precode parity check groups
     const PARITY_GROUPS = [
       [15, 34, 8, 23, 30, 20, 18, 2],
       [0, 5, 26, 22, 32, 19, 7, 9],
@@ -306,6 +324,7 @@
       [10, 19, 32, 18, 3, 15, 35, 16],
       [31, 13, 21, 17, 35, 34, 9, 14],
     ];
+
     const DEFAULT_MESSAGE = [
       "110011",
       "110011",
@@ -316,28 +335,52 @@
     ].join("");
     const pixels = [...DEFAULT_MESSAGE].map((bit) => bit === "1");
 
-    let bits = "00000";
-    let timer = null;
-    let nextIndex = 0;
-    let txPackets = [];
+    // ===== UTILITIES =====
 
-    function normalize(value) {
-      return String(value).replace(/[^01]/g, "").padEnd(5, "0").slice(0, 5);
+    // Simple linear congruential RNG
+    class SeededRNG {
+      constructor(seed) {
+        this.state = seed >>> 0; // Ensure 32-bit unsigned
+      }
+
+      next() {
+        this.state = (Math.imul(this.state, 1103515245) + 12345) >>> 0;
+        return this.state;
+      }
+
+      nextBit() {
+        return (this.next() >>> 16) & 1;
+      }
+
+      // Irregular LDGM degree distribution. Degree-1 rows bootstrap soft BP from zero priors.
+      nextNeighbors(maxIndex) {
+        const r = (this.next() >>> 0) / 0x100000000; // Uniform [0, 1)
+        let degree = 3;
+
+        if (r < 0.20) degree = 1;
+        else if (r < 0.50) degree = 2;
+        else if (r < 0.75) degree = 3;
+        else if (r < 0.90) degree = 4;
+        else if (r < 0.97) degree = 5;
+        else degree = 6;
+
+        const neighbors = [];
+        while (neighbors.length < degree) {
+          const candidate = this.next() % maxIndex;
+          if (!neighbors.includes(candidate)) {
+            neighbors.push(candidate);
+          }
+        }
+        return neighbors;
+      }
     }
 
-    function messageBits() {
-      return pixels.map((on) => on ? "1" : "0").join("");
-    }
-
-    function parityGroup(index) {
-      return PARITY_GROUPS[index];
-    }
-
-    function parityBits(payload) {
+    // Encode message -> 60-bit codeword via finite LDPC precode
+    function finiteParityBits(payload) {
       let parity = "";
       for (let index = 0; index < PARITY_BITS; index += 1) {
         let bit = 0;
-        parityGroup(index).forEach((payloadIndex) => {
+        PARITY_GROUPS[index].forEach((payloadIndex) => {
           if (payload[payloadIndex] === "1") bit ^= 1;
         });
         parity += String(bit);
@@ -345,14 +388,27 @@
       return parity;
     }
 
-    function encodedPackets() {
-      const payload = messageBits();
-      const codeword = (payload + parityBits(payload)).padEnd(CODEWORD_BITS, "0");
-      const packets = [];
-      for (let offset = 0; offset < codeword.length; offset += PACKET_BITS) {
-        packets.push(codeword.slice(offset, offset + PACKET_BITS));
-      }
-      return [...PREAMBLE, ...packets];
+    function encodeLDPCPrecode(messageBits) {
+      // Encode 36-bit message -> 60-bit codeword (with padding)
+      const codeword = (messageBits + finiteParityBits(messageBits)).padEnd(CODEWORD_BITS, "0");
+      return codeword.split("").map((c) => c === "1" ? 1 : 0);
+    }
+
+    // ===== STATE & TRANSMISSION =====
+
+    let bits = "00000";
+    let timer = null;
+    let nextPacketIndex = 0; // Absolute packet index (includes preamble)
+    let codeword = null; // Current encoded codeword (60-bit array)
+    let ldgmRng = new SeededRNG(SEED1);
+    let rate = 8;
+
+    function normalize(value) {
+      return String(value).replace(/[^01]/g, "").padEnd(5, "0").slice(0, 5);
+    }
+
+    function messageBits() {
+      return pixels.map((on) => on ? "1" : "0").join("");
     }
 
     function render(nextBits) {
@@ -363,29 +419,61 @@
         const bit = Number(led.dataset.bit);
         led.dataset.on = bits[4 - bit];
       });
+    }
 
+    function getNextPacketBits() {
+      if (nextPacketIndex < PREAMBLE.length) {
+        // Preamble phase
+        return PREAMBLE[nextPacketIndex].split("").map((c) => Number(c));
+      }
+
+      // Fountain payload phase: generate continuous LDGM measurements
+      if (codeword === null) {
+        codeword = encodeLDPCPrecode(messageBits());
+      }
+
+      const packetMeasurements = [];
+      for (let i = 0; i < MEASUREMENTS_PER_PACKET; i++) {
+        const neighbors = ldgmRng.nextNeighbors(CODEWORD_BITS);
+        let measurement = 0;
+        neighbors.forEach((index) => {
+          measurement ^= codeword[index];
+        });
+        packetMeasurements.push(measurement);
+      }
+
+      return packetMeasurements;
     }
 
     function step() {
-      if (timer === null && txPackets.length === 0) {
-        txPackets = encodedPackets();
-      }
-      if (nextIndex >= txPackets.length) {
-        completeTransmission();
-        return;
-      }
+      const packetBits = getNextPacketBits();
+      render(packetBits.map((b) => String(b)).join(""));
+      nextPacketIndex += 1;
+    }
 
-      render(txPackets[nextIndex]);
-      nextIndex += 1;
+    function setRate(nextRate) {
+      if (timer !== null) return;
+      rate = nextRate;
+      rateButtons.forEach((button) => {
+        button.setAttribute("aria-pressed", button.dataset.rate === String(rate) ? "true" : "false");
+      });
+    }
+
+    function setRateLocked(locked) {
+      rateButtons.forEach((button) => {
+        button.disabled = locked;
+      });
     }
 
     function start() {
       if (timer !== null) return;
-      txPackets = encodedPackets();
-      nextIndex = 0;
+      nextPacketIndex = 0;
+      codeword = null;
+      ldgmRng = new SeededRNG(SEED1);
       step();
-      timer = window.setInterval(step, 1000 / Math.max(1, Math.min(30, Number(fps.value) || 1)));
+      timer = window.setInterval(step, 1000 / rate);
       play.textContent = "Stop";
+      setRateLocked(true);
     }
 
     function stop() {
@@ -394,21 +482,7 @@
         timer = null;
       }
       play.textContent = "Start";
-      finishTransmission();
-    }
-
-    function completeTransmission() {
-      if (timer !== null) {
-        window.clearInterval(timer);
-        timer = null;
-      }
-      play.textContent = "Start";
-      finishTransmission();
-    }
-
-    function finishTransmission() {
-      nextIndex = 0;
-      txPackets = [];
+      setRateLocked(false);
       render("00000");
     }
 
@@ -428,13 +502,11 @@
     }
 
     play.addEventListener("click", () => timer === null ? start() : stop());
-    fps.addEventListener("input", () => {
-      if (timer !== null) {
-        stop();
-        start();
-      }
+    rateButtons.forEach((button) => {
+      button.addEventListener("click", () => setRate(Number(button.dataset.rate)));
     });
 
+    setRate(rate);
     renderMessageGrid();
     render(bits);
   </script>

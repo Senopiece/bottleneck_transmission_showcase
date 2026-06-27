@@ -11,9 +11,10 @@ class ScoreLogger {
         scores: FloatArray?,
         event: PacketClockDecoder.Result?,
         state: String,
+        bpDebug: String? = null,
     ) {
         if (!headerLogged) {
-            Log.d(SCORE_CSV_TAG, "timestampNs,detected,s0,s1,s2,s3,s4,event")
+            Log.d(SCORE_CSV_TAG, "timestampNs,detected,s0,s1,s2,s3,s4,event,bpDebug")
             headerLogged = true
         }
         val eventValue = when {
@@ -24,16 +25,33 @@ class ScoreLogger {
         }
         val debugValue = event?.debugInfo?.let { info ->
             listOf(
+                "sym=${info.emittedSymbol}",
+                "decision=${info.decision.ifEmpty { "-" }}",
+                "reject=${info.rejectReason.ifEmpty { "-" }}",
                 "periodMs=${String.format(Locale.US, "%.2f", info.periodNs / 1_000_000f)}",
                 "measuredMs=${String.format(Locale.US, "%.2f", info.measuredPeriodNs / 1_000_000f)}",
+                "preMode=${info.preambleEstimateMode.ifEmpty { "-" }}",
+                "preI=${String.format(Locale.US, "%.2f", info.preambleFirstIntervalNs / 1_000_000f)}|" +
+                    String.format(Locale.US, "%.2f", info.preambleSecondIntervalNs / 1_000_000f),
                 "late=${info.periodsElapsed}",
                 "samples=${info.sampleCount}",
                 "weight=${String.format(Locale.US, "%.3f", info.sampleWeightSum)}",
+                "phase=${String.format(Locale.US, "%.3f", info.averageSamplePhase)}",
+                "th=${String.format(Locale.US, "%.3f", info.onThreshold)}|" +
+                    "${String.format(Locale.US, "%.3f", info.weakOnAverage)}|" +
+                    "${String.format(Locale.US, "%.3f", info.offThreshold)}|" +
+                    "${String.format(Locale.US, "%.3f", info.offPeakLimit)}",
+                "corrMs=${String.format(Locale.US, "%.2f", info.clockCorrectionNs / 1_000_000f)}",
+                "periodCorrMs=${String.format(Locale.US, "%.2f", info.periodCorrectionNs / 1_000_000f)}",
+                "edge=${String.format(Locale.US, "%.3f", info.edgeScore)}",
+                "edgeCount=${info.edgeLedCount}",
+                "edgeErrMs=${String.format(Locale.US, "%.2f", info.edgeErrorNs / 1_000_000f)}",
                 "avg=${formatArray(info.averages)}",
                 "peak=${formatArray(info.peaks)}",
                 "rel=${formatArray(info.reliabilities)}",
             ).joinToString(separator = " ")
         }
+        val bpDebugValue = bpDebug?.replace(Regex("[,\n\r]"), " ") ?: ""
         val scoreColumns = if (scores == null) {
             ",,,,"
         } else {
@@ -41,7 +59,7 @@ class ScoreLogger {
         }
         Log.d(
             SCORE_CSV_TAG,
-            "$timestampNs,${if (scores == null) 0 else 1},$scoreColumns,$eventValue${debugValue?.let { " $it" } ?: ""}",
+            "$timestampNs,${if (scores == null) 0 else 1},$scoreColumns,$eventValue${debugValue?.let { " $it" } ?: ""},$bpDebugValue",
         )
     }
 
@@ -51,6 +69,6 @@ class ScoreLogger {
     }
 
     private companion object {
-        const val SCORE_CSV_TAG = "LedScoresCsv"
+        const val SCORE_CSV_TAG = "LedDecoderDebug"
     }
 }

@@ -6,6 +6,7 @@ class ScoreLogger {
         scores: FloatArray?,
         event: PacketClockDecoder.Result?,
         state: String,
+        bpDebug: String? = null,
     ) {
     }
 }

@@ -22,7 +22,9 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
@@ -30,6 +32,7 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -133,6 +136,9 @@ private fun ReaderApp(viewModel: ReaderViewModel = viewModel()) {
     val notices by viewModel.notices.collectAsStateWithLifecycle()
     val decodeProgress by viewModel.decodeProgress.collectAsStateWithLifecycle()
     val decodedMessage by viewModel.decodedMessage.collectAsStateWithLifecycle()
+    val liveMessageBits by viewModel.liveMessageBits.collectAsStateWithLifecycle()
+    val liveBitConfidences by viewModel.liveBitConfidences.collectAsStateWithLifecycle()
+    val liveDecoding by viewModel.liveDecoding.collectAsStateWithLifecycle()
     val problem by viewModel.problem.collectAsStateWithLifecycle()
     val restartToken by viewModel.restartToken.collectAsStateWithLifecycle()
 
@@ -153,6 +159,9 @@ private fun ReaderApp(viewModel: ReaderViewModel = viewModel()) {
         DecodeProgressBelowGuide(
             progress = decodeProgress,
             message = decodedMessage,
+            liveMessageBits = liveMessageBits,
+            liveBitConfidences = liveBitConfidences,
+            liveDecoding = liveDecoding,
             onStop = viewModel::stopDecoding,
         )
 
@@ -326,6 +335,9 @@ private fun DetectionOverlay(
 private fun DecodeProgressBelowGuide(
     progress: DecodeProgress,
     message: DecodedMessage?,
+    liveMessageBits: List<Boolean>,
+    liveBitConfidences: List<Float>,
+    liveDecoding: Boolean,
     onStop: () -> Unit,
 ) {
     val haptic = LocalHapticFeedback.current
@@ -341,13 +353,19 @@ private fun DecodeProgressBelowGuide(
         val topOffset = (maxHeight - roiHeight) / 2 + roiHeight + 10.dp
         Column(
             modifier = Modifier
-                .align(Alignment.TopCenter)
-                .padding(top = topOffset),
+                .align(Alignment.TopEnd)
+                .padding(top = topOffset, end = 12.dp),
             verticalArrangement = Arrangement.spacedBy(6.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
+            horizontalAlignment = Alignment.End,
         ) {
             if (progress.visible) {
-                DecodeProgressCard(progress = progress, onStop = onStop)
+                LiveBitCertaintyCard(
+                    progress = progress,
+                    liveMessageBits = liveMessageBits,
+                    liveBitConfidences = liveBitConfidences,
+                    liveDecoding = liveDecoding,
+                    onStop = onStop,
+                )
             } else if (message != null) {
                 DecodedMessageGrid(message = message)
             }
@@ -356,52 +374,109 @@ private fun DecodeProgressBelowGuide(
 }
 
 @Composable
-private fun DecodeProgressCard(
+private fun LiveBitCertaintyCard(
     progress: DecodeProgress,
+    liveMessageBits: List<Boolean>,
+    liveBitConfidences: List<Float>,
+    liveDecoding: Boolean,
     onStop: () -> Unit,
 ) {
-    val required = progress.requiredPackets.coerceAtLeast(1)
-    val received = progress.receivedPackets.coerceIn(0, required)
-    val ratio = received.toFloat() / required.toFloat()
     val background = if (progress.failed) Color(0xFFFF3B30) else Color.White
     val foreground = if (progress.failed) Color.White else Color.Black
+    val completion = progress.confidenceProgress.coerceIn(0f, 1f)
     Box(
         modifier = Modifier
-            .background(background, RoundedCornerShape(3.dp))
-            .padding(horizontal = 16.dp, vertical = 10.dp),
-        contentAlignment = Alignment.Center,
+            .background(background, RoundedCornerShape(6.dp))
+            .padding(12.dp)
+            .widthIn(max = 220.dp),
     ) {
         Column(
-            verticalArrangement = Arrangement.spacedBy(6.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
+            modifier = Modifier.fillMaxWidth(),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
             Text(
-                text = "${(ratio * 100f).toInt()}%  $received / $required",
+                text = when {
+                    progress.failed -> "Decode failed"
+                    liveDecoding -> "Live BP certainty"
+                    else -> "Waiting for confidence"
+                },
                 color = foreground,
                 fontSize = 16.sp,
                 fontWeight = FontWeight.Bold,
-                letterSpacing = 0.sp,
             )
-            Canvas(
-                modifier = Modifier
-                    .width(152.dp)
-                    .height(8.dp),
+
+            LiveBitCertaintyGrid(
+                bits = liveMessageBits,
+                confidences = liveBitConfidences,
+                failed = progress.failed,
+            )
+
+            Text(
+                text = if (progress.failed) "Tap cancel to reset" else "Confidence ${(completion * 100f).toInt()}%",
+                color = foreground,
+                fontSize = 14.sp,
+            )
+
+            LinearProgressIndicator(
+                progress = completion,
+                modifier = Modifier.fillMaxWidth(),
+                color = if (progress.failed) Color.White else Color.Black,
+                trackColor = if (progress.failed) Color.White.copy(alpha = 0.28f) else Color.Black.copy(alpha = 0.16f),
+            )
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.End,
             ) {
-                drawRoundRect(
-                    color = if (progress.failed) Color(0x44FFFFFF) else Color(0x22000000),
-                    size = size,
-                    cornerRadius = CornerRadius(3.dp.toPx(), 3.dp.toPx()),
-                )
-                drawRoundRect(
-                    color = foreground,
-                    size = Size(size.width * ratio, size.height),
-                    cornerRadius = CornerRadius(3.dp.toPx(), 3.dp.toPx()),
-                )
-            }
-            if (!progress.failed) {
                 Button(onClick = onStop) {
-                    Text("Stop")
+                    Text(if (progress.failed) "Reset" else "Cancel")
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun LiveBitCertaintyGrid(
+    bits: List<Boolean>,
+    confidences: List<Float>,
+    failed: Boolean,
+) {
+    val bitsCount = minOf(bits.size, 36)
+    Canvas(
+        modifier = Modifier
+            .width(152.dp)
+            .height(152.dp)
+            .background(Color(0xFFF2F2F2), RoundedCornerShape(4.dp)),
+    ) {
+        val gridSize = 6
+        val gap = 2.dp.toPx()
+        val cell = (minOf(size.width, size.height) - gap * (gridSize - 1)) / gridSize
+
+        for (row in 0 until gridSize) {
+            for (col in 0 until gridSize) {
+                val index = row * gridSize + col
+                if (index >= bitsCount) continue
+                val bit = bits.getOrNull(index) == true
+                val confidence = confidences.getOrNull(index) ?: 0f
+                val intensity = confidence.coerceIn(0f, 1f)
+                val fill = when {
+                    failed -> Color(0xFFCCCCCC)
+                    intensity < 0.40f -> Color(0xFFB0B0B0)
+                    bit -> Color.Black.copy(alpha = 0.35f + intensity * 0.65f)
+                    else -> Color.White.copy(alpha = 0.35f + intensity * 0.65f)
+                }
+                drawRect(
+                    color = fill,
+                    topLeft = Offset(col * (cell + gap), row * (cell + gap)),
+                    size = Size(cell, cell),
+                )
+                drawRect(
+                    color = Color(0x55000000),
+                    topLeft = Offset(col * (cell + gap), row * (cell + gap)),
+                    size = Size(cell, cell),
+                    style = Stroke(width = 1.dp.toPx()),
+                )
             }
         }
     }
