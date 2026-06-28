@@ -72,8 +72,6 @@ data class PacketEvent(
 )
 
 data class DecodeProgress(
-    val receivedPackets: Int = 0,
-    val requiredPackets: Int = 0,
     val confidenceProgress: Float = 0f,
     val visible: Boolean = false,
     val failed: Boolean = false,
