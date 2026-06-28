@@ -8,9 +8,9 @@ import kotlin.math.tanh
  * Incremental soft BP decoder for the rateless LDGM layer plus the finite parity precode.
  *
  * LLR convention: positive means bit 0 is more likely, negative means bit 1 is more likely.
- * The graph is bounded: new LDGM observations replace the oldest LDGM factors after
- * MAX_MEASUREMENTS. Belief propagation is advanced separately by pump(), so compute is decoupled
- * from packet arrival rate.
+ * The graph is bounded: new LDGM observations replace the oldest active LDGM factors after
+ * ACTIVE_MEASUREMENTS. Belief propagation is advanced separately by pump(), so compute is
+ * decoupled from packet arrival rate.
  */
 class FountainDecoder {
     data class PacketDebug(
@@ -29,6 +29,7 @@ class FountainDecoder {
         val expectedErrors: Float,
         val complete: Boolean,
         val measurements: Int,
+        val totalMeasurements: Int,
         val minAbsLlr: Float,
         val avgAbsLlr: Float,
         val maxAbsLlr: Float,
@@ -94,12 +95,13 @@ class FountainDecoder {
         }
     }
 
-    private val factors = ArrayList<Factor>(PARITY_BITS + MAX_MEASUREMENTS)
-    private val edges = ArrayList<Edge>((PARITY_BITS + MAX_MEASUREMENTS) * 6)
+    private val factors = ArrayList<Factor>(PARITY_BITS + ACTIVE_MEASUREMENTS)
+    private val edges = ArrayList<Edge>((PARITY_BITS + ACTIVE_MEASUREMENTS) * 6)
     private val variableEdges = Array(CODEWORD_BITS) { ArrayList<Int>(32) }
     private val posterior = FloatArray(CODEWORD_BITS)
-    private val residualQueue = ResidualQueue(PARITY_BITS + MAX_MEASUREMENTS)
+    private val residualQueue = ResidualQueue(PARITY_BITS + ACTIVE_MEASUREMENTS)
     private var measurementCount = 0
+    private var totalMeasurementCount = 0
     private var nextMeasurementSlot = 0
     private var lastPacketDebug: PacketDebug? = null
 
@@ -194,6 +196,7 @@ class FountainDecoder {
             expectedErrors = expectedErrors,
             complete = readyToFinalize && consistency.parityViolations == 0,
             measurements = measurementCount,
+            totalMeasurements = totalMeasurementCount,
             minAbsLlr = if (minAbsLlr.isFinite()) minAbsLlr else 0f,
             avgAbsLlr = sumAbsLlr / MESSAGE_BITS,
             maxAbsLlr = maxAbsLlr,
@@ -216,6 +219,7 @@ class FountainDecoder {
         java.util.Arrays.fill(posterior, 0f)
         residualQueue.clear()
         measurementCount = 0
+        totalMeasurementCount = 0
         nextMeasurementSlot = 0
         lastPacketDebug = null
         for (check in 0 until PARITY_BITS) {
@@ -242,16 +246,17 @@ class FountainDecoder {
 
     private fun addMeasurementFactor(observedLlr: Float, variables: IntArray) {
         val slot = nextMeasurementSlot
-        nextMeasurementSlot = (nextMeasurementSlot + 1) % MAX_MEASUREMENTS
+        nextMeasurementSlot = (nextMeasurementSlot + 1) % ACTIVE_MEASUREMENTS
         val factorIndex = PARITY_BITS + slot
         replaceMeasurementFactor(
             factorIndex = factorIndex,
             observedLlr = observedLlr,
             variables = variables,
         )
-        if (measurementCount < MAX_MEASUREMENTS) {
+        if (measurementCount < ACTIVE_MEASUREMENTS) {
             measurementCount += 1
         }
+        totalMeasurementCount += 1
     }
 
     private fun replaceMeasurementFactor(factorIndex: Int, observedLlr: Float, variables: IntArray) {
@@ -598,6 +603,7 @@ class FountainDecoder {
         private const val DEGREE_3_CUTOFF = 3_221_225_472L
         private const val DEGREE_4_CUTOFF = 3_865_470_566L
         private const val DEGREE_5_CUTOFF = 4_166_118_277L
+        const val ACTIVE_MEASUREMENTS = 60
         const val MAX_MEASUREMENTS = 360
         private const val LLR_CLAMP = 7.0f
         private const val HARD_ZERO_LLR = 7.0f

@@ -101,7 +101,7 @@ class FountainDecoderController {
                 debug = appendFailureDebug(debugLine, "parity_failed"),
             )
         }
-        if (snapshot.measurements >= FountainDecoder.MAX_MEASUREMENTS && !snapshot.readyToFinalize) {
+        if (snapshot.totalMeasurements >= FountainDecoder.MAX_MEASUREMENTS && !snapshot.readyToFinalize) {
             saturatedPumpTicks += 1
         } else {
             saturatedPumpTicks = 0
@@ -137,6 +137,7 @@ class FountainDecoderController {
             "skipped=${packet?.skippedFactors ?: 0}",
             "deg=${formatDegreeHistogram(packet?.degreeHistogram)}",
             "measurements=${snapshot.measurements}",
+            "totalMeasurements=${snapshot.totalMeasurements}",
             "progress=${fmt(snapshot.progress)}",
             "best=${fmt(bestProgress)}",
             "backtrack=$lowProgressPackets",
@@ -160,6 +161,7 @@ class FountainDecoderController {
             "payload=$payloadPackets",
             "observed=$observedPayloadPackets",
             "measurements=${snapshot.measurements}",
+            "totalMeasurements=${snapshot.totalMeasurements}",
             "progress=${fmt(snapshot.progress)}",
             "best=${fmt(bestProgress)}",
             "expectedErrors=${fmt(snapshot.expectedErrors)}",
