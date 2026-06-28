@@ -24,9 +24,18 @@ class FountainDecoderController {
     private var state = State.WaitingPreamble
     private var payloadPackets = 0
     private var observedPayloadPackets = 0
-    private var lowProgressPackets = 0
     private var bestProgress = 0f
     private var saturatedPumpTicks = 0
+    private var frozenPosterior: FloatArray? = null
+    private var frozenProgress = 0f
+    private val predictiveBadWindow = FloatArray(PREDICTIVE_BAD_WINDOW_SIZE)
+    private var predictiveBadWindowIndex = 0
+    private var predictiveBadWindowCount = 0
+    private var consecutivePredictiveHits = 0
+    private var lastPredictiveScore = 0f
+    private var lastPredictiveBad = 0f
+    private var lastPredictiveBadWindow = 0f
+    private var lastPredictiveSkipped = false
 
     @Synchronized
     fun startPreamble() {
@@ -47,19 +56,26 @@ class FountainDecoderController {
         payloadPackets += 1
         val observedPayload = bitLlrs != null && bitLlrs.size == FountainDecoder.PACKET_BITS
         if (observedPayload) observedPayloadPackets += 1
-        val snapshot = decoder.addPacket(packetIndex = packetIndex, bits = bits, bitLlrs = bitLlrs)
+        val useBitLlrs = if (observedPayload && predictiveGuardRejects(packetIndex, bitLlrs)) {
+            if (consecutivePredictiveHits >= PREDICTIVE_FAIL_CONSECUTIVE_HITS) {
+                state = State.Failed
+                return ProcessResult(
+                    state = State.Failed,
+                    failureReason = "Decode failed: stream became inconsistent",
+                    debug = buildPredictiveFailureDebug(packetIndex, bits),
+                )
+            }
+            null
+        } else {
+            bitLlrs
+        }
+        val snapshot = decoder.addPacket(packetIndex = packetIndex, bits = bits, bitLlrs = useBitLlrs)
         val debugLine = if (Diagnostics.enabled) buildDebugLine(packetIndex, bits, snapshot) else ""
 
-        if (!observedPayload) {
-            lowProgressPackets = (lowProgressPackets - 1).coerceAtLeast(0)
-        } else if (snapshot.progress + PROGRESS_BACKTRACK_TOLERANCE < bestProgress) {
-            lowProgressPackets += 1
-        } else {
-            lowProgressPackets = 0
-        }
         if (snapshot.progress > bestProgress) bestProgress = snapshot.progress
+        updateFrozenPosterior(snapshot)
 
-        return evaluateSnapshot(snapshot, debugLine, allowInconsistentFail = true)
+        return evaluateSnapshot(snapshot, debugLine)
     }
 
     @Synchronized
@@ -73,26 +89,68 @@ class FountainDecoderController {
 
         val snapshot = decoder.pump(BP_ITERATIONS_PER_PUMP)
         if (snapshot.progress > bestProgress) bestProgress = snapshot.progress
+        updateFrozenPosterior(snapshot)
         val debugLine = if (Diagnostics.enabled) buildPumpDebugLine(snapshot) else ""
-        return evaluateSnapshot(snapshot, debugLine, allowInconsistentFail = false)
+        return evaluateSnapshot(snapshot, debugLine)
+    }
+
+    private fun predictiveGuardRejects(packetIndex: Int, bitLlrs: FloatArray?): Boolean {
+        lastPredictiveSkipped = false
+        val reference = frozenPosterior
+        if (reference == null || bitLlrs == null || frozenProgress < PREDICTIVE_MIN_PROGRESS) {
+            lastPredictiveScore = 0f
+            lastPredictiveBad = 0f
+            lastPredictiveBadWindow = predictiveBadWindowSum()
+            consecutivePredictiveHits = 0
+            return false
+        }
+        val packetLogScore = decoder.predictivePacketLogScore(
+            packetIndex = packetIndex,
+            bitLlrs = bitLlrs,
+            referencePosterior = reference,
+        )
+        lastPredictiveScore = packetLogScore
+        lastPredictiveBad = (-packetLogScore).coerceAtLeast(0f)
+        pushPredictiveBadScore(lastPredictiveBad)
+        lastPredictiveBadWindow = predictiveBadWindowSum()
+        val hit = lastPredictiveBad >= PREDICTIVE_PACKET_BAD_MIN &&
+            lastPredictiveBadWindow >= PREDICTIVE_BAD_WINDOW_THRESHOLD
+        if (hit) {
+            consecutivePredictiveHits += 1
+            lastPredictiveSkipped = true
+        } else {
+            consecutivePredictiveHits = 0
+        }
+        return hit
+    }
+
+    private fun updateFrozenPosterior(snapshot: FountainDecoder.Snapshot) {
+        if (snapshot.progress >= PREDICTIVE_MIN_PROGRESS && snapshot.progress >= frozenProgress) {
+            frozenPosterior = decoder.copyPosterior()
+            frozenProgress = snapshot.progress
+        }
+    }
+
+    private fun pushPredictiveBadScore(value: Float) {
+        predictiveBadWindow[predictiveBadWindowIndex] = value
+        predictiveBadWindowIndex = (predictiveBadWindowIndex + 1) % predictiveBadWindow.size
+        if (predictiveBadWindowCount < predictiveBadWindow.size) {
+            predictiveBadWindowCount += 1
+        }
+    }
+
+    private fun predictiveBadWindowSum(): Float {
+        var sum = 0f
+        for (index in 0 until predictiveBadWindowCount) {
+            sum += predictiveBadWindow[index]
+        }
+        return sum
     }
 
     private fun evaluateSnapshot(
         snapshot: FountainDecoder.Snapshot,
         debugLine: String,
-        allowInconsistentFail: Boolean,
     ): ProcessResult {
-        if (allowInconsistentFail &&
-            payloadPackets >= MIN_PACKETS_BEFORE_CONSISTENCY_FAIL &&
-            lowProgressPackets >= MAX_BACKTRACK_PACKETS
-        ) {
-            state = State.Failed
-            return ProcessResult(
-                state = State.Failed,
-                failureReason = "Decode failed: stream became inconsistent",
-                debug = appendFailureDebug(debugLine, "inconsistent"),
-            )
-        }
         if (snapshot.readyToFinalize && snapshot.parityViolations != 0) {
             state = State.Failed
             return ProcessResult(
@@ -140,7 +198,12 @@ class FountainDecoderController {
             "totalMeasurements=${snapshot.totalMeasurements}",
             "progress=${fmt(snapshot.progress)}",
             "best=${fmt(bestProgress)}",
-            "backtrack=$lowProgressPackets",
+            "frozen=${fmt(frozenProgress)}",
+            "predLog=${fmt(lastPredictiveScore)}",
+            "predBad=${fmt(lastPredictiveBad)}",
+            "badwin4=${fmt(lastPredictiveBadWindow)}",
+            "predHits=$consecutivePredictiveHits",
+            "predSkip=$lastPredictiveSkipped",
             "expectedErrors=${fmt(snapshot.expectedErrors)}",
             "ready=${snapshot.readyToFinalize}",
             "minLlr=${fmt(snapshot.minAbsLlr)}",
@@ -164,6 +227,11 @@ class FountainDecoderController {
             "totalMeasurements=${snapshot.totalMeasurements}",
             "progress=${fmt(snapshot.progress)}",
             "best=${fmt(bestProgress)}",
+            "frozen=${fmt(frozenProgress)}",
+            "predLog=${fmt(lastPredictiveScore)}",
+            "predBad=${fmt(lastPredictiveBad)}",
+            "badwin4=${fmt(lastPredictiveBadWindow)}",
+            "predHits=$consecutivePredictiveHits",
             "expectedErrors=${fmt(snapshot.expectedErrors)}",
             "ready=${snapshot.readyToFinalize}",
             "parityBad=${snapshot.parityViolations}",
@@ -175,6 +243,22 @@ class FountainDecoderController {
 
     private fun appendFailureDebug(debugLine: String, failure: String): String {
         return if (debugLine.isEmpty()) "" else "$debugLine fail=$failure"
+    }
+
+    private fun buildPredictiveFailureDebug(packetIndex: Int, bits: String?): String {
+        if (!Diagnostics.enabled) return ""
+        return listOf(
+            "payload=$payloadPackets",
+            "observed=$observedPayloadPackets",
+            "packetIndex=$packetIndex",
+            "raw=${bits ?: "erasure"}",
+            "frozen=${fmt(frozenProgress)}",
+            "predLog=${fmt(lastPredictiveScore)}",
+            "predBad=${fmt(lastPredictiveBad)}",
+            "badwin4=${fmt(lastPredictiveBadWindow)}",
+            "predHits=$consecutivePredictiveHits",
+            "fail=inconsistent",
+        ).joinToString(separator = " ")
     }
 
     private fun fmt(value: Float): String {
@@ -202,16 +286,27 @@ class FountainDecoderController {
         state = State.WaitingPreamble
         payloadPackets = 0
         observedPayloadPackets = 0
-        lowProgressPackets = 0
         bestProgress = 0f
         saturatedPumpTicks = 0
+        frozenPosterior = null
+        frozenProgress = 0f
+        java.util.Arrays.fill(predictiveBadWindow, 0f)
+        predictiveBadWindowIndex = 0
+        predictiveBadWindowCount = 0
+        consecutivePredictiveHits = 0
+        lastPredictiveScore = 0f
+        lastPredictiveBad = 0f
+        lastPredictiveBadWindow = 0f
+        lastPredictiveSkipped = false
     }
 
     companion object {
-        private const val MIN_PACKETS_BEFORE_CONSISTENCY_FAIL = 12
-        private const val MAX_BACKTRACK_PACKETS = 10
-        private const val PROGRESS_BACKTRACK_TOLERANCE = 0.18f
         private const val BP_ITERATIONS_PER_PUMP = 1
         private const val MAX_SATURATED_PUMP_TICKS = 240
+        private const val PREDICTIVE_MIN_PROGRESS = 0.25f
+        private const val PREDICTIVE_BAD_WINDOW_SIZE = 4
+        private const val PREDICTIVE_BAD_WINDOW_THRESHOLD = 2.0f
+        private const val PREDICTIVE_PACKET_BAD_MIN = 0.15f
+        private const val PREDICTIVE_FAIL_CONSECUTIVE_HITS = 2
     }
 }

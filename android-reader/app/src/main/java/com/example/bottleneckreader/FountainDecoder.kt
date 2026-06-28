@@ -2,6 +2,7 @@ package com.example.bottleneckreader
 
 import kotlin.math.abs
 import kotlin.math.exp
+import kotlin.math.ln
 import kotlin.math.tanh
 
 /**
@@ -155,6 +156,30 @@ class FountainDecoder {
             runIterations(iterations)
         }
         return snapshot()
+    }
+
+    @Synchronized
+    fun copyPosterior(): FloatArray {
+        updatePosterior()
+        return posterior.copyOf()
+    }
+
+    fun predictivePacketLogScore(
+        packetIndex: Int,
+        bitLlrs: FloatArray,
+        referencePosterior: FloatArray,
+    ): Float {
+        if (bitLlrs.size != PACKET_BITS || referencePosterior.size != CODEWORD_BITS) return 0f
+        var score = 0f
+        for (bitIndex in 0 until PACKET_BITS) {
+            val variables = measurementNeighbors(packetIndex * PACKET_BITS + bitIndex)
+            val predictedLlr = predictedMeasurementLlr(referencePosterior, variables)
+            score += compatibilityLogScore(
+                predictedLlr = predictedLlr,
+                observedLlr = bitLlrs[bitIndex].coerceIn(-LLR_CLAMP, LLR_CLAMP),
+            )
+        }
+        return score
     }
 
     @Synchronized
@@ -485,6 +510,25 @@ class FountainDecoder {
         return tanh((llr * 0.5f).coerceIn(-10f, 10f))
     }
 
+    private fun predictedMeasurementLlr(referencePosterior: FloatArray, variables: IntArray): Float {
+        var product = 1f
+        for (variableIndex in variables) {
+            product *= tanhHalf(referencePosterior[variableIndex].coerceIn(-LLR_CLAMP, LLR_CLAMP))
+        }
+        return (2f * atanhClamped(product)).coerceIn(-LLR_CLAMP, LLR_CLAMP)
+    }
+
+    private fun compatibilityLogScore(predictedLlr: Float, observedLlr: Float): Float {
+        val predictedZero = zeroProbability(predictedLlr)
+        val observedZero = zeroProbability(observedLlr)
+        val compatibility = predictedZero * observedZero + (1f - predictedZero) * (1f - observedZero)
+        return ln((2f * compatibility).coerceAtLeast(MIN_COMPATIBILITY).toDouble()).toFloat()
+    }
+
+    private fun zeroProbability(llr: Float): Float {
+        return 1f / (1f + exp((-llr).coerceIn(-MAX_EXP, MAX_EXP)))
+    }
+
     private fun atanhClamped(value: Float): Float {
         val x = value.coerceIn(-0.9999f, 0.9999f)
         return (0.5f * kotlin.math.ln(((1f + x) / (1f - x)).toDouble())).toFloat()
@@ -613,6 +657,7 @@ class FountainDecoder {
         private const val MIN_RESIDUAL_DELTA = 0.002f
         private const val TARGET_EXPECTED_ERRORS = 0.28f
         private const val MAX_EXP = 12f
+        private const val MIN_COMPATIBILITY = 1e-6f
         private const val MAX_DEBUG_DEGREE = 6
         private val EMPTY_DEBUG_HISTOGRAM = IntArray(0)
 
