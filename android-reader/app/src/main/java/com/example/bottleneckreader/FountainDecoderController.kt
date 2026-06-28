@@ -26,7 +26,6 @@ class FountainDecoderController {
     private var observedPayloadPackets = 0
     private var lowProgressPackets = 0
     private var bestProgress = 0f
-    private var lowAgreementPackets = 0
 
     @Synchronized
     fun startPreamble() {
@@ -43,30 +42,21 @@ class FountainDecoderController {
             return ProcessResult(state = state)
         }
 
-        val packetIndex = PREAMBLE_SIZE + payloadPackets
+        val packetIndex = payloadPackets
         payloadPackets += 1
-        val snapshot = decoder.addPacket(packetIndex = packetIndex, bits = bits, bitLlrs = bitLlrs)
-        val debugLine = if (Diagnostics.enabled) buildDebugLine(packetIndex, bits, snapshot) else ""
         val observedPayload = bitLlrs != null && bitLlrs.size == FountainDecoder.PACKET_BITS
         if (observedPayload) observedPayloadPackets += 1
+        val snapshot = decoder.addPacket(packetIndex = packetIndex, bits = bits, bitLlrs = bitLlrs)
+        val debugLine = if (Diagnostics.enabled) buildDebugLine(packetIndex, bits, snapshot) else ""
 
         if (!observedPayload) {
             lowProgressPackets = (lowProgressPackets - 1).coerceAtLeast(0)
-            lowAgreementPackets = (lowAgreementPackets - 1).coerceAtLeast(0)
         } else if (snapshot.progress + PROGRESS_BACKTRACK_TOLERANCE < bestProgress) {
             lowProgressPackets += 1
         } else {
             lowProgressPackets = 0
         }
         if (snapshot.progress > bestProgress) bestProgress = snapshot.progress
-        if (observedPayload &&
-            observedPayloadPackets >= MIN_OBSERVED_PACKETS_BEFORE_AGREEMENT_FAIL &&
-            snapshot.channelAgreement < MIN_RUNNING_CHANNEL_AGREEMENT
-        ) {
-            lowAgreementPackets += 1
-        } else if (observedPayload) {
-            lowAgreementPackets = 0
-        }
 
         if (payloadPackets >= MIN_PACKETS_BEFORE_CONSISTENCY_FAIL && lowProgressPackets >= MAX_BACKTRACK_PACKETS) {
             state = State.Failed
@@ -76,12 +66,12 @@ class FountainDecoderController {
                 debug = appendFailureDebug(debugLine, "inconsistent"),
             )
         }
-        if (lowAgreementPackets >= MAX_LOW_AGREEMENT_PACKETS) {
+        if (snapshot.readyToFinalize && snapshot.parityViolations != 0) {
             state = State.Failed
             return ProcessResult(
                 state = State.Failed,
-                failureReason = "Decode failed: payload does not match stream timing",
-                debug = appendFailureDebug(debugLine, "low_agreement"),
+                failureReason = "Decode failed: parity check failed",
+                debug = appendFailureDebug(debugLine, "parity_failed"),
             )
         }
         if (snapshot.measurements >= MAX_MEASUREMENTS_WITHOUT_DECODE && !snapshot.complete) {
@@ -92,15 +82,6 @@ class FountainDecoderController {
                 debug = appendFailureDebug(debugLine, "no_converge"),
             )
         }
-        if (payloadPackets >= MAX_PAYLOAD_PACKETS_WITHOUT_DECODE && !snapshot.complete) {
-            state = State.Failed
-            return ProcessResult(
-                state = State.Failed,
-                failureReason = "Decode failed: too many erased or weak packets",
-                debug = appendFailureDebug(debugLine, "too_many_packets"),
-            )
-        }
-
         state = if (snapshot.complete) State.Complete else State.Decoding
         return ProcessResult(
             state = state,
@@ -127,8 +108,8 @@ class FountainDecoderController {
             "progress=${fmt(snapshot.progress)}",
             "best=${fmt(bestProgress)}",
             "backtrack=$lowProgressPackets",
-            "lowAgree=$lowAgreementPackets",
             "expectedErrors=${fmt(snapshot.expectedErrors)}",
+            "ready=${snapshot.readyToFinalize}",
             "minLlr=${fmt(snapshot.minAbsLlr)}",
             "avgLlr=${fmt(snapshot.avgAbsLlr)}",
             "maxLlr=${fmt(snapshot.maxAbsLlr)}",
@@ -172,18 +153,12 @@ class FountainDecoderController {
         observedPayloadPackets = 0
         lowProgressPackets = 0
         bestProgress = 0f
-        lowAgreementPackets = 0
     }
 
     companion object {
-        private const val PREAMBLE_SIZE = 4
         private const val MIN_PACKETS_BEFORE_CONSISTENCY_FAIL = 12
         private const val MAX_BACKTRACK_PACKETS = 10
-        private const val MIN_OBSERVED_PACKETS_BEFORE_AGREEMENT_FAIL = 18
-        private const val MIN_RUNNING_CHANNEL_AGREEMENT = 0.80f
-        private const val MAX_LOW_AGREEMENT_PACKETS = 5
         private const val PROGRESS_BACKTRACK_TOLERANCE = 0.18f
         private const val MAX_MEASUREMENTS_WITHOUT_DECODE = 360
-        private const val MAX_PAYLOAD_PACKETS_WITHOUT_DECODE = 120
     }
 }

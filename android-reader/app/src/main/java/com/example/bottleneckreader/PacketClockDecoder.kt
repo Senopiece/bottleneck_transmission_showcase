@@ -25,18 +25,11 @@ class PacketClockDecoder {
         val sampleCount: Int = 0,
         val sampleWeightSum: Float = 0f,
         val averageSamplePhase: Float = 0f,
-        val clockCorrectionNs: Long = 0L,
-        val periodCorrectionNs: Long = 0L,
-        val edgeScore: Float = 0f,
-        val edgeLedCount: Int = 0,
-        val edgeErrorNs: Long = 0L,
         val averages: FloatArray = FloatArray(0),
         val peaks: FloatArray = FloatArray(0),
         val reliabilities: FloatArray = FloatArray(0),
         val onThreshold: Float = 0f,
-        val weakOnAverage: Float = 0f,
         val offThreshold: Float = 0f,
-        val offPeakLimit: Float = 0f,
     )
 
     enum class PacketKind {
@@ -99,7 +92,7 @@ class PacketClockDecoder {
 
         val packet = scoresToPacket(scores)
         return when (phase) {
-            Phase.WaitingZeros -> acceptWaitingZeros(scores, packet)
+            Phase.WaitingZeros -> acceptWaitingZeros(scores)
             Phase.WaitingPreamble -> acceptPreamble(scores, packet, timestampNs)
             Phase.Active -> acceptActive(scores, timestampNs)
         }
@@ -117,8 +110,8 @@ class PacketClockDecoder {
         resetInternal()
     }
 
-    private fun acceptWaitingZeros(scores: FloatArray, packet: String): Result? {
-        if (packet == ZERO_PACKET && isStableZero(scores)) {
+    private fun acceptWaitingZeros(scores: FloatArray): Result? {
+        if (isStableZero(scores)) {
             zeroFrames += 1
             if (zeroFrames >= REQUIRED_ZERO_FRAMES) {
                 resetPreamble()
@@ -289,42 +282,29 @@ class PacketClockDecoder {
     }
 
     private fun estimatePreamblePeriod(): Long {
-        lastPreambleEstimateMode = "default"
+        lastPreambleEstimateMode = "allowed_default"
         lastPreambleFirstIntervalNs = 0L
         lastPreambleSecondIntervalNs = 0L
         if (preambleIntervalCount == 0) return DEFAULT_PERIOD_NS
-        if (preambleIntervalCount == 1) {
-            lastPreambleEstimateMode = "single"
-            lastPreambleFirstIntervalNs = preambleIntervalsNs[0]
-            return preambleIntervalsNs[0].coerceIn(MIN_PERIOD_NS, MAX_PERIOD_NS)
+        lastPreambleFirstIntervalNs = preambleIntervalsNs[0]
+        if (preambleIntervalCount > 1) {
+            lastPreambleSecondIntervalNs = preambleIntervalsNs[1]
         }
 
-        val first = preambleIntervalsNs[0]
-        val second = preambleIntervalsNs[1]
-        lastPreambleFirstIntervalNs = first
-        lastPreambleSecondIntervalNs = second
-        val longer = kotlin.math.max(first, second)
-        val shorter = kotlin.math.min(first, second)
-        val measured = if (
-            longer in FAST_ASYMMETRIC_LONG_MIN_NS..FAST_ASYMMETRIC_LONG_MAX_NS &&
-            shorter in FAST_ASYMMETRIC_SHORT_MIN_NS..FAST_ASYMMETRIC_SHORT_MAX_NS
-        ) {
-            lastPreambleEstimateMode = "fast_asymmetric_long"
-            // At high rates exposure overlap makes the final 11111 preamble appear early.
-            // The shorter interval is usually biased down, so the longer interval is the
-            // better anchor. Averaging the pair was the source of 106..118ms false periods.
-            (longer * FAST_ASYMMETRIC_LONG_SCALE).toLong()
-        } else if (shorter * 100L < longer * SHORT_PREAMBLE_INTERVAL_PERCENT) {
-            lastPreambleEstimateMode = "early_final_long"
-            // The all-on final preamble can be observed early during camera exposure overlap.
-            // In that case the longer interval is better than the average, but using it raw
-            // tends to overestimate the period, so keep a small guard below it.
-            (longer * EARLY_FINAL_PERIOD_SCALE).toLong()
-        } else {
-            lastPreambleEstimateMode = "average"
-            (first + second) / 2L
+        var bestPeriod = ALLOWED_PERIODS_NS[0]
+        var bestError = Long.MAX_VALUE
+        for (candidate in ALLOWED_PERIODS_NS) {
+            var error = 0L
+            for (index in 0 until preambleIntervalCount) {
+                error += kotlin.math.abs(preambleIntervalsNs[index] - candidate)
+            }
+            if (error < bestError) {
+                bestError = error
+                bestPeriod = candidate
+            }
         }
-        return measured.coerceIn(MIN_PERIOD_NS, MAX_PERIOD_NS)
+        lastPreambleEstimateMode = "allowed_${1_000_000_000L / bestPeriod}hz"
+        return bestPeriod
     }
 
     private fun correctedFinalPreambleAt(
@@ -333,8 +313,10 @@ class PacketClockDecoder {
         lastIntervalNs: Long,
     ): Long {
         if (previousPreambleAtNs == 0L || lastIntervalNs == 0L) return observedFinalAtNs
-        return if (lastIntervalNs * 100L < periodNs * EARLY_FINAL_ANCHOR_PERCENT) {
-            previousPreambleAtNs + periodNs
+        val expectedFinalAtNs = previousPreambleAtNs + periodNs
+        val observedError = kotlin.math.abs(observedFinalAtNs - expectedFinalAtNs)
+        return if (observedError > periodNs * PREAMBLE_ANCHOR_ERROR_PERCENT / 100L) {
+            expectedFinalAtNs
         } else {
             observedFinalAtNs
         }
@@ -444,7 +426,6 @@ class PacketClockDecoder {
         val averages = FloatArray(BIT_COUNT)
         val peaks = symbolScoreMax.copyOf()
         val onThreshold = onThreshold()
-        val weakOnAverage = weakOnAverageThreshold()
         val bits = buildString(BIT_COUNT) {
             for (index in 0 until BIT_COUNT) {
                 val average = symbolScoreSums[index] / symbolWeightSum
@@ -472,9 +453,7 @@ class PacketClockDecoder {
                 peaks = peaks,
                 reliabilities = reliabilities.copyOf(),
                 onThreshold = onThreshold,
-                weakOnAverage = weakOnAverage,
                 offThreshold = SYMBOL_OFF_THRESHOLD,
-                offPeakLimit = SYMBOL_OFF_PEAK_LIMIT,
             ),
         )
     }
@@ -483,20 +462,26 @@ class PacketClockDecoder {
         return if (periodNs <= FAST_PERIOD_NS) FAST_SYMBOL_ON_THRESHOLD else SYMBOL_ON_THRESHOLD
     }
 
-    private fun weakOnAverageThreshold(): Float {
-        return if (periodNs <= FAST_PERIOD_NS) FAST_SYMBOL_WEAK_ON_AVERAGE else SYMBOL_WEAK_ON_AVERAGE
-    }
-
     private fun scoreToRawLlr(average: Float, peak: Float, onThreshold: Float): Float {
         val midpoint = (SYMBOL_OFF_THRESHOLD + onThreshold) * 0.5f
         val scale = (onThreshold - SYMBOL_OFF_THRESHOLD).coerceAtLeast(0.05f)
         val averageLlr = (midpoint - average) / scale * SCORE_LLR_SCALE
-        val peakBoost = if (peak > SYMBOL_STRONG_ON_THRESHOLD && average > midpoint) {
+        val peakBoost = if (
+            symbolSampleCount >= MIN_PEAK_BOOST_SAMPLES &&
+            symbolWeightSum >= MIN_PEAK_BOOST_WEIGHT &&
+            peak > SYMBOL_STRONG_ON_THRESHOLD &&
+            average > midpoint
+        ) {
             -((peak - SYMBOL_STRONG_ON_THRESHOLD) / SCORE_PEAK_SCALE).coerceIn(0f, SCORE_PEAK_LLR_BOOST)
         } else {
             0f
         }
-        return (averageLlr + peakBoost).coerceIn(-SCORE_LLR_CLAMP, SCORE_LLR_CLAMP)
+        val sampleConfidence = when {
+            symbolSampleCount <= 1 -> SINGLE_SAMPLE_LLR_SCALE
+            symbolSampleCount == 2 -> DOUBLE_SAMPLE_LLR_SCALE
+            else -> 1f
+        }
+        return ((averageLlr + peakBoost) * sampleConfidence).coerceIn(-SCORE_LLR_CLAMP, SCORE_LLR_CLAMP)
     }
 
     private fun debugBit(rawLlr: Float): Char {
@@ -593,24 +578,18 @@ class PacketClockDecoder {
         const val SYMBOL_ON_THRESHOLD = 0.94f
         const val FAST_SYMBOL_ON_THRESHOLD = 1.05f
         const val SYMBOL_STRONG_ON_THRESHOLD = 1.12f
-        const val SYMBOL_WEAK_ON_AVERAGE = 0.72f
-        const val FAST_SYMBOL_WEAK_ON_AVERAGE = 1.05f
         const val SYMBOL_OFF_THRESHOLD = 0.56f
-        const val SYMBOL_OFF_PEAK_LIMIT = 0.86f
         const val SCORE_LLR_SCALE = 3.0f
         const val SCORE_LLR_CLAMP = 3.0f
         const val SCORE_PEAK_SCALE = 0.30f
         const val SCORE_PEAK_LLR_BOOST = 0.8f
+        const val MIN_PEAK_BOOST_SAMPLES = 2
+        const val MIN_PEAK_BOOST_WEIGHT = 0.45f
+        const val SINGLE_SAMPLE_LLR_SCALE = 0.68f
+        const val DOUBLE_SAMPLE_LLR_SCALE = 0.88f
         const val DEBUG_BIT_ERASURE_LLR = 0.30f
         const val FAST_PERIOD_NS = 135_000_000L
-        const val FAST_ASYMMETRIC_LONG_SCALE = 0.88f
-        const val FAST_ASYMMETRIC_LONG_MIN_NS = 115_000_000L
-        const val FAST_ASYMMETRIC_LONG_MAX_NS = 190_000_000L
-        const val FAST_ASYMMETRIC_SHORT_MIN_NS = 40_000_000L
-        const val FAST_ASYMMETRIC_SHORT_MAX_NS = 130_000_000L
-        const val SHORT_PREAMBLE_INTERVAL_PERCENT = 86L
-        const val EARLY_FINAL_PERIOD_SCALE = 0.97f
-        const val EARLY_FINAL_ANCHOR_PERCENT = 88L
+        const val PREAMBLE_ANCHOR_ERROR_PERCENT = 18L
         const val MEDIUM_PERIOD_NS = 180_000_000L
         val ALLOWED_PERIODS_NS = longArrayOf(500_000_000L, 250_000_000L, 125_000_000L)
         const val FAST_SYMBOL_EDGE_LIMIT = 0.38f

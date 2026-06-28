@@ -38,14 +38,7 @@ class ScoreLogger {
                 "weight=${String.format(Locale.US, "%.3f", info.sampleWeightSum)}",
                 "phase=${String.format(Locale.US, "%.3f", info.averageSamplePhase)}",
                 "th=${String.format(Locale.US, "%.3f", info.onThreshold)}|" +
-                    "${String.format(Locale.US, "%.3f", info.weakOnAverage)}|" +
-                    "${String.format(Locale.US, "%.3f", info.offThreshold)}|" +
-                    "${String.format(Locale.US, "%.3f", info.offPeakLimit)}",
-                "corrMs=${String.format(Locale.US, "%.2f", info.clockCorrectionNs / 1_000_000f)}",
-                "periodCorrMs=${String.format(Locale.US, "%.2f", info.periodCorrectionNs / 1_000_000f)}",
-                "edge=${String.format(Locale.US, "%.3f", info.edgeScore)}",
-                "edgeCount=${info.edgeLedCount}",
-                "edgeErrMs=${String.format(Locale.US, "%.2f", info.edgeErrorNs / 1_000_000f)}",
+                    String.format(Locale.US, "%.3f", info.offThreshold),
                 "avg=${formatArray(info.averages)}",
                 "peak=${formatArray(info.peaks)}",
                 "rel=${formatArray(info.reliabilities)}",

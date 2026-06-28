@@ -36,6 +36,7 @@ class FountainDecoder {
         val channelTotalWeight: Float,
         val channelMismatchedFactors: Int,
         val parityViolations: Int,
+        val readyToFinalize: Boolean,
         val hardBits: String,
         val packetDebug: PacketDebug?,
     )
@@ -63,13 +64,13 @@ class FountainDecoder {
         }
 
         fun nextNeighbors(maxIndex: Int): IntArray {
-            val r = (next() and 0xFFFFFFFFL).toFloat() / RNG_FLOAT_SCALE
+            val r = next() and UINT_MASK
             val degree = when {
-                r < 0.20f -> 1
-                r < 0.50f -> 2
-                r < 0.75f -> 3
-                r < 0.90f -> 4
-                r < 0.97f -> 5
+                r < DEGREE_1_CUTOFF -> 1
+                r < DEGREE_2_CUTOFF -> 2
+                r < DEGREE_3_CUTOFF -> 3
+                r < DEGREE_4_CUTOFF -> 4
+                r < DEGREE_5_CUTOFF -> 5
                 else -> 6
             }
             val unique = IntArray(degree)
@@ -96,7 +97,6 @@ class FountainDecoder {
     private val edges = ArrayList<Edge>((PARITY_BITS + MAX_MEASUREMENTS) * 6)
     private val variableEdges = Array(CODEWORD_BITS) { ArrayList<Int>(32) }
     private val posterior = FloatArray(CODEWORD_BITS)
-    private val ldgmRng = SeededRng(LDGM_SEED)
     private var measurementCount = 0
     private var lastPacketDebug: PacketDebug? = null
 
@@ -115,7 +115,7 @@ class FountainDecoder {
         var addedFactors = 0
         var skippedFactors = 0
         for (bitIndex in 0 until PACKET_BITS) {
-            val variables = ldgmRng.nextNeighbors(CODEWORD_BITS)
+            val variables = measurementNeighbors(packetIndex * PACKET_BITS + bitIndex)
             if (Diagnostics.enabled) {
                 degreeHistogram[variables.size.coerceIn(0, MAX_DEBUG_DEGREE)] += 1
             }
@@ -165,28 +165,25 @@ class FountainDecoder {
                 hardBits?.append(if (bits[index]) '1' else '0')
             }
             val absLlr = abs(llr)
+            val errorProbability = 1f / (1f + exp(absLlr.coerceIn(-MAX_EXP, MAX_EXP)))
+            expectedErrors += errorProbability
             if (index < MESSAGE_BITS) {
                 if (absLlr < minAbsLlr) minAbsLlr = absLlr
                 if (absLlr > maxAbsLlr) maxAbsLlr = absLlr
                 sumAbsLlr += absLlr
-                val errorProbability = 1f / (1f + exp(absLlr.coerceIn(-MAX_EXP, MAX_EXP)))
-                expectedErrors += errorProbability
                 certainties[index] = (1f - 2f * errorProbability).coerceIn(0f, 1f)
             }
         }
         val consistency = hardConsistency(hardCodeword)
-        val progress = ((MESSAGE_BITS * 0.5f - expectedErrors) / (MESSAGE_BITS * 0.5f - TARGET_EXPECTED_ERRORS))
+        val progress = ((CODEWORD_BITS * 0.5f - expectedErrors) / (CODEWORD_BITS * 0.5f - TARGET_EXPECTED_ERRORS))
             .coerceIn(0f, 1f)
+        val readyToFinalize = expectedErrors <= TARGET_EXPECTED_ERRORS
         return Snapshot(
             bits = bits,
             certainties = certainties,
             progress = progress,
             expectedErrors = expectedErrors,
-            complete = measurementCount >= MIN_COMPLETE_MEASUREMENTS &&
-                expectedErrors <= TARGET_EXPECTED_ERRORS &&
-                minAbsLlr >= MIN_COMPLETE_LLR &&
-                consistency.parityViolations == 0 &&
-                consistency.channelAgreement >= MIN_COMPLETE_CHANNEL_AGREEMENT,
+            complete = readyToFinalize && consistency.parityViolations == 0,
             measurements = measurementCount,
             minAbsLlr = if (minAbsLlr.isFinite()) minAbsLlr else 0f,
             avgAbsLlr = sumAbsLlr / MESSAGE_BITS,
@@ -196,6 +193,7 @@ class FountainDecoder {
             channelTotalWeight = consistency.channelTotalWeight,
             channelMismatchedFactors = consistency.channelMismatchedFactors,
             parityViolations = consistency.parityViolations,
+            readyToFinalize = readyToFinalize,
             hardBits = hardBits?.toString() ?: "",
             packetDebug = lastPacketDebug,
         )
@@ -207,7 +205,6 @@ class FountainDecoder {
         edges.clear()
         for (list in variableEdges) list.clear()
         java.util.Arrays.fill(posterior, 0f)
-        ldgmRng.state = LDGM_SEED
         measurementCount = 0
         lastPacketDebug = null
         for (check in 0 until PARITY_BITS) {
@@ -229,6 +226,17 @@ class FountainDecoder {
             edgeIndexes[edgeOffset] = edgeIndex
         }
         factors += Factor(observedLlr = observedLlr.coerceIn(-LLR_CLAMP, LLR_CLAMP), edgeIndexes = edgeIndexes)
+    }
+
+    private fun measurementNeighbors(measurementIndex: Int): IntArray {
+        return SeededRng(mixMeasurementSeed(measurementIndex)).nextNeighbors(CODEWORD_BITS)
+    }
+
+    private fun mixMeasurementSeed(measurementIndex: Int): Long {
+        var x = (LDGM_SEED + measurementIndex.toLong() * MIX_GOLDEN_RATIO) and UINT_MASK
+        x = ((x xor (x ushr 16)) * MIX_MURMUR_1) and UINT_MASK
+        x = ((x xor (x ushr 13)) * MIX_MURMUR_2) and UINT_MASK
+        return (x xor (x ushr 16)) and UINT_MASK
     }
 
     private fun runIterations(iterations: Int) {
@@ -335,18 +343,23 @@ class FountainDecoder {
         const val PACKET_BITS = 5
 
         private const val LDGM_SEED = 0x12345678L
+        private const val UINT_MASK = 0xFFFFFFFFL
+        private const val MIX_GOLDEN_RATIO = 0x9E3779B9L
+        private const val MIX_MURMUR_1 = 0x85EBCA6BL
+        private const val MIX_MURMUR_2 = 0xC2B2AE35L
+        private const val DEGREE_1_CUTOFF = 858_993_459L
+        private const val DEGREE_2_CUTOFF = 2_147_483_648L
+        private const val DEGREE_3_CUTOFF = 3_221_225_472L
+        private const val DEGREE_4_CUTOFF = 3_865_470_566L
+        private const val DEGREE_5_CUTOFF = 4_166_118_277L
         private const val MAX_MEASUREMENTS = 360
-        private const val MIN_COMPLETE_MEASUREMENTS = 90
         private const val BP_ITERATIONS_PER_PACKET = 8
         private const val LLR_CLAMP = 7.0f
         private const val HARD_ZERO_LLR = 7.0f
         private const val MESSAGE_DAMPING = 0.55f
         private const val TARGET_EXPECTED_ERRORS = 0.28f
-        private const val MIN_COMPLETE_LLR = 1.45f
-        private const val MIN_COMPLETE_CHANNEL_AGREEMENT = 0.82f
         private const val MAX_EXP = 12f
         private const val MAX_DEBUG_DEGREE = 6
-        private const val RNG_FLOAT_SCALE = 4_294_967_296.0f
         private val EMPTY_DEBUG_HISTOGRAM = IntArray(0)
 
         val LDPC_GROUPS: Array<IntArray> = arrayOf(

@@ -377,12 +377,7 @@ class ReaderViewModel : ViewModel() {
             "w=${fmt(debug.sampleWeightSum)} phase=${fmt(debug.averageSamplePhase)} " +
             "avg=${formatFloatArray(debug.averages)} peak=${formatFloatArray(debug.peaks)} " +
             "rel=${formatFloatArray(debug.reliabilities)} " +
-            "th=${fmt(debug.onThreshold)}/${fmt(debug.weakOnAverage)}/" +
-            "${fmt(debug.offThreshold)}/${fmt(debug.offPeakLimit)} " +
-            "corrMs=${fmt(debug.clockCorrectionNs / 1_000_000f)} " +
-            "pcorrMs=${fmt(debug.periodCorrectionNs / 1_000_000f)} " +
-            "edge=${fmt(debug.edgeScore)} edgeN=${debug.edgeLedCount} " +
-            "edgeErrMs=${fmt(debug.edgeErrorNs / 1_000_000f)}"
+            "th=${fmt(debug.onThreshold)}/${fmt(debug.offThreshold)}"
     }
 
     private fun fmt(value: Float): String {

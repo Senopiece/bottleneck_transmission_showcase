@@ -159,8 +159,6 @@
       background: var(--kbd-bg);
       color: var(--kbd-fg);
       font: inherit;
-    }
-
       padding: 0 12px;
       font-weight: 650;
       cursor: pointer;
@@ -354,14 +352,14 @@
 
       // Irregular LDGM degree distribution. Degree-1 rows bootstrap soft BP from zero priors.
       nextNeighbors(maxIndex) {
-        const r = (this.next() >>> 0) / 0x100000000; // Uniform [0, 1)
+        const r = this.next() >>> 0;
         let degree = 3;
 
-        if (r < 0.20) degree = 1;
-        else if (r < 0.50) degree = 2;
-        else if (r < 0.75) degree = 3;
-        else if (r < 0.90) degree = 4;
-        else if (r < 0.97) degree = 5;
+        if (r < 858993459) degree = 1;
+        else if (r < 2147483648) degree = 2;
+        else if (r < 3221225472) degree = 3;
+        else if (r < 3865470566) degree = 4;
+        else if (r < 4166118277) degree = 5;
         else degree = 6;
 
         const neighbors = [];
@@ -394,13 +392,24 @@
       return codeword.split("").map((c) => c === "1" ? 1 : 0);
     }
 
+    function mixMeasurementSeed(measurementIndex) {
+      let x = (SEED1 + Math.imul(measurementIndex >>> 0, 0x9E3779B9)) >>> 0;
+      x = Math.imul((x ^ (x >>> 16)) >>> 0, 0x85EBCA6B) >>> 0;
+      x = Math.imul((x ^ (x >>> 13)) >>> 0, 0xC2B2AE35) >>> 0;
+      return (x ^ (x >>> 16)) >>> 0;
+    }
+
+    function measurementNeighbors(measurementIndex) {
+      return new SeededRNG(mixMeasurementSeed(measurementIndex)).nextNeighbors(CODEWORD_BITS);
+    }
+
     // ===== STATE & TRANSMISSION =====
 
     let bits = "00000";
     let timer = null;
+    let nextTickAtMs = 0;
     let nextPacketIndex = 0; // Absolute packet index (includes preamble)
     let codeword = null; // Current encoded codeword (60-bit array)
-    let ldgmRng = new SeededRNG(SEED1);
     let rate = 8;
 
     function normalize(value) {
@@ -432,9 +441,10 @@
         codeword = encodeLDPCPrecode(messageBits());
       }
 
+      const payloadPacketIndex = nextPacketIndex - PREAMBLE.length;
       const packetMeasurements = [];
       for (let i = 0; i < MEASUREMENTS_PER_PACKET; i++) {
-        const neighbors = ldgmRng.nextNeighbors(CODEWORD_BITS);
+        const neighbors = measurementNeighbors(payloadPacketIndex * MEASUREMENTS_PER_PACKET + i);
         let measurement = 0;
         neighbors.forEach((index) => {
           measurement ^= codeword[index];
@@ -449,6 +459,19 @@
       const packetBits = getNextPacketBits();
       render(packetBits.map((b) => String(b)).join(""));
       nextPacketIndex += 1;
+    }
+
+    function scheduleNextStep() {
+      if (timer === null) return;
+      nextTickAtMs += 1000 / rate;
+      const delayMs = Math.max(0, nextTickAtMs - performance.now());
+      timer = window.setTimeout(tick, delayMs);
+    }
+
+    function tick() {
+      if (timer === null) return;
+      step();
+      scheduleNextStep();
     }
 
     function setRate(nextRate) {
@@ -469,16 +492,17 @@
       if (timer !== null) return;
       nextPacketIndex = 0;
       codeword = null;
-      ldgmRng = new SeededRNG(SEED1);
+      nextTickAtMs = performance.now();
+      timer = 0;
       step();
-      timer = window.setInterval(step, 1000 / rate);
+      scheduleNextStep();
       play.textContent = "Stop";
       setRateLocked(true);
     }
 
     function stop() {
       if (timer !== null) {
-        window.clearInterval(timer);
+        window.clearTimeout(timer);
         timer = null;
       }
       play.textContent = "Start";
