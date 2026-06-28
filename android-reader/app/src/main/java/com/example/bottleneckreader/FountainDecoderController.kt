@@ -26,6 +26,7 @@ class FountainDecoderController {
     private var observedPayloadPackets = 0
     private var lowProgressPackets = 0
     private var bestProgress = 0f
+    private var saturatedPumpTicks = 0
 
     @Synchronized
     fun startPreamble() {
@@ -58,7 +59,33 @@ class FountainDecoderController {
         }
         if (snapshot.progress > bestProgress) bestProgress = snapshot.progress
 
-        if (payloadPackets >= MIN_PACKETS_BEFORE_CONSISTENCY_FAIL && lowProgressPackets >= MAX_BACKTRACK_PACKETS) {
+        return evaluateSnapshot(snapshot, debugLine, allowInconsistentFail = true)
+    }
+
+    @Synchronized
+    fun pump(): ProcessResult {
+        if (state == State.Failed || state == State.Complete) {
+            return ProcessResult(state = state)
+        }
+        if (state == State.WaitingPreamble) {
+            return ProcessResult(state = state)
+        }
+
+        val snapshot = decoder.pump(BP_ITERATIONS_PER_PUMP)
+        if (snapshot.progress > bestProgress) bestProgress = snapshot.progress
+        val debugLine = if (Diagnostics.enabled) buildPumpDebugLine(snapshot) else ""
+        return evaluateSnapshot(snapshot, debugLine, allowInconsistentFail = false)
+    }
+
+    private fun evaluateSnapshot(
+        snapshot: FountainDecoder.Snapshot,
+        debugLine: String,
+        allowInconsistentFail: Boolean,
+    ): ProcessResult {
+        if (allowInconsistentFail &&
+            payloadPackets >= MIN_PACKETS_BEFORE_CONSISTENCY_FAIL &&
+            lowProgressPackets >= MAX_BACKTRACK_PACKETS
+        ) {
             state = State.Failed
             return ProcessResult(
                 state = State.Failed,
@@ -74,7 +101,12 @@ class FountainDecoderController {
                 debug = appendFailureDebug(debugLine, "parity_failed"),
             )
         }
-        if (snapshot.measurements >= MAX_MEASUREMENTS_WITHOUT_DECODE && !snapshot.complete) {
+        if (snapshot.measurements >= FountainDecoder.MAX_MEASUREMENTS && !snapshot.readyToFinalize) {
+            saturatedPumpTicks += 1
+        } else {
+            saturatedPumpTicks = 0
+        }
+        if (saturatedPumpTicks >= MAX_SATURATED_PUMP_TICKS && !snapshot.complete) {
             state = State.Failed
             return ProcessResult(
                 state = State.Failed,
@@ -122,6 +154,23 @@ class FountainDecoderController {
         ).joinToString(separator = " ")
     }
 
+    private fun buildPumpDebugLine(snapshot: FountainDecoder.Snapshot): String {
+        return listOf(
+            "pump=bp",
+            "payload=$payloadPackets",
+            "observed=$observedPayloadPackets",
+            "measurements=${snapshot.measurements}",
+            "progress=${fmt(snapshot.progress)}",
+            "best=${fmt(bestProgress)}",
+            "expectedErrors=${fmt(snapshot.expectedErrors)}",
+            "ready=${snapshot.readyToFinalize}",
+            "parityBad=${snapshot.parityViolations}",
+            "complete=${snapshot.complete}",
+            "saturated=$saturatedPumpTicks",
+            "hard=${snapshot.hardBits}",
+        ).joinToString(separator = " ")
+    }
+
     private fun appendFailureDebug(debugLine: String, failure: String): String {
         return if (debugLine.isEmpty()) "" else "$debugLine fail=$failure"
     }
@@ -153,12 +202,14 @@ class FountainDecoderController {
         observedPayloadPackets = 0
         lowProgressPackets = 0
         bestProgress = 0f
+        saturatedPumpTicks = 0
     }
 
     companion object {
         private const val MIN_PACKETS_BEFORE_CONSISTENCY_FAIL = 12
         private const val MAX_BACKTRACK_PACKETS = 10
         private const val PROGRESS_BACKTRACK_TOLERANCE = 0.18f
-        private const val MAX_MEASUREMENTS_WITHOUT_DECODE = 360
+        private const val BP_ITERATIONS_PER_PUMP = 1
+        private const val MAX_SATURATED_PUMP_TICKS = 240
     }
 }

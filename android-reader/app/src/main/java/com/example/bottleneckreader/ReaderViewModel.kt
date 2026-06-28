@@ -3,6 +3,7 @@ package com.example.bottleneckreader
 import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -22,6 +23,7 @@ class ReaderViewModel : ViewModel() {
     private var preambleProgressPackets = 0
     private var lastDebugFailureMessage: String? = null
     private var lastDebugFailureAtNs = 0L
+    private var bpPumpJob: Job? = null
 
     private val _frame = MutableStateFlow<DetectionFrame?>(null)
     val frame: StateFlow<DetectionFrame?> = _frame.asStateFlow()
@@ -110,6 +112,7 @@ class ReaderViewModel : ViewModel() {
         preambleProgressPackets = 0
         _decodedMessage.value = null
         resetLiveDecoderState()
+        stopBpPump()
         updateDecodeProgress(visible = false, confidenceProgress = 0f, failed = false)
         packetDecoder.finishMessage()
         fountainDecoderController.reset()
@@ -152,9 +155,11 @@ class ReaderViewModel : ViewModel() {
             preambleProgressPackets = 0
             _decodedMessage.value = null
             resetLiveDecoderState()
+            stopBpPump()
             updateDecodeProgress(visible = false, confidenceProgress = 0f, failed = false)
             fountainDecoderController.reset()
         } else {
+            stopBpPump()
             fountainDecoderController.reset()
             val result = event
             onPacketResult(timestampNs, result)
@@ -209,6 +214,9 @@ class ReaderViewModel : ViewModel() {
         preambleProgressPackets = (preambleProgressPackets + 1).coerceAtMost(PREAMBLE_PROGRESS_PACKETS)
         updateDecodeProgress(confidenceProgress = preambleUiProgress())
         logDebug("preamble=$bits progress=$preambleProgressPackets/$PREAMBLE_PROGRESS_PACKETS clock ${formatClockDebug(clockDebug)}")
+        if (preambleProgressPackets >= PREAMBLE_PROGRESS_PACKETS) {
+            startBpPump()
+        }
     }
 
     private fun onPayloadPacket(
@@ -232,6 +240,22 @@ class ReaderViewModel : ViewModel() {
             scoreLogger.log(timestampNs, null, null, packetDecoder.debugState, result.debug)
         }
 
+        applyFountainResult(result)
+    }
+
+    @Synchronized
+    private fun onBpPumpTick() {
+        if (_decodeProgress.value.failed || preambleProgressPackets < PREAMBLE_PROGRESS_PACKETS) return
+        val result = fountainDecoderController.pump()
+        if (result.state == FountainDecoderController.State.WaitingPreamble) return
+        logDebug(result.debug)
+        if (Diagnostics.enabled && result.debug.isNotEmpty()) {
+            scoreLogger.log(System.nanoTime(), null, null, packetDecoder.debugState, result.debug)
+        }
+        applyFountainResult(result)
+    }
+
+    private fun applyFountainResult(result: FountainDecoderController.ProcessResult) {
         val confidence = result.confidence
         val messageBits = result.messageBits
         if (result.state == FountainDecoderController.State.Failed) {
@@ -253,11 +277,27 @@ class ReaderViewModel : ViewModel() {
                 bits = BooleanArray(messageBits.size) { index -> messageBits[index] },
             )
             resetLiveDecoderState()
+            stopBpPump()
             packetDecoder.finishMessage()
             preambleProgressPackets = 0
             updateDecodeProgress(visible = false, confidenceProgress = 1f)
             logDebug("fountain message decoded")
         }
+    }
+
+    private fun startBpPump() {
+        if (bpPumpJob?.isActive == true) return
+        bpPumpJob = viewModelScope.launch {
+            while (true) {
+                delay(BP_PUMP_INTERVAL_MS)
+                onBpPumpTick()
+            }
+        }
+    }
+
+    private fun stopBpPump() {
+        bpPumpJob?.cancel()
+        bpPumpJob = null
     }
 
     private fun appendPacketEvent(timestampNs: Long, bits: String?) {
@@ -296,6 +336,7 @@ class ReaderViewModel : ViewModel() {
         logDebug(message)
         packetDecoder.finishMessage()
         fountainDecoderController.reset()
+        stopBpPump()
         _decodedMessage.value = null
         resetLiveDecoderState()
         if (!_decodeProgress.value.visible) {
@@ -316,6 +357,7 @@ class ReaderViewModel : ViewModel() {
                 return@launch
             }
             preambleProgressPackets = 0
+            stopBpPump()
             updateDecodeProgress(visible = false, confidenceProgress = 0f, failed = false, failureId = failureId)
         }
     }
@@ -392,6 +434,7 @@ class ReaderViewModel : ViewModel() {
         const val PREAMBLE_PROGRESS_PACKETS = 3
         const val PREAMBLE_UI_PROGRESS = 0.02f
         const val ACTIVE_UI_PROGRESS = 0.98f
+        const val BP_PUMP_INTERVAL_MS = 16L
         const val TIMING_WINDOW_SIZE = 90
         const val NOTICE_VISIBLE_MS = 3_200L
         const val NOTICE_EXIT_MS = 420L

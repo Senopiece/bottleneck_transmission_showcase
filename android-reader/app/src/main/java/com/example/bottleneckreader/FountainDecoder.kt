@@ -8,8 +8,9 @@ import kotlin.math.tanh
  * Incremental soft BP decoder for the rateless LDGM layer plus the finite parity precode.
  *
  * LLR convention: positive means bit 0 is more likely, negative means bit 1 is more likely.
- * The graph is bounded: new LDGM observations are accepted until MAX_MEASUREMENTS, and each
- * packet runs a fixed number of BP sweeps over that bounded graph.
+ * The graph is bounded: new LDGM observations replace the oldest LDGM factors after
+ * MAX_MEASUREMENTS. Belief propagation is advanced separately by pump(), so compute is decoupled
+ * from packet arrival rate.
  */
 class FountainDecoder {
     data class PacketDebug(
@@ -42,15 +43,15 @@ class FountainDecoder {
     )
 
     private data class Edge(
-        val factorIndex: Int,
-        val variableIndex: Int,
+        var factorIndex: Int,
+        var variableIndex: Int,
         var variableToFactor: Float = 0f,
         var factorToVariable: Float = 0f,
     )
 
     private data class Factor(
-        val observedLlr: Float,
-        val edgeIndexes: IntArray,
+        var observedLlr: Float,
+        var edgeIndexes: IntArray,
     )
 
     private class SeededRng(var state: Long) {
@@ -97,7 +98,9 @@ class FountainDecoder {
     private val edges = ArrayList<Edge>((PARITY_BITS + MAX_MEASUREMENTS) * 6)
     private val variableEdges = Array(CODEWORD_BITS) { ArrayList<Int>(32) }
     private val posterior = FloatArray(CODEWORD_BITS)
+    private val residualQueue = ResidualQueue(PARITY_BITS + MAX_MEASUREMENTS)
     private var measurementCount = 0
+    private var nextMeasurementSlot = 0
     private var lastPacketDebug: PacketDebug? = null
 
     init {
@@ -119,12 +122,11 @@ class FountainDecoder {
             if (Diagnostics.enabled) {
                 degreeHistogram[variables.size.coerceIn(0, MAX_DEBUG_DEGREE)] += 1
             }
-            if (llrs != null && measurementCount < MAX_MEASUREMENTS) {
-                addFactor(
+            if (llrs != null) {
+                addMeasurementFactor(
                     observedLlr = llrs[bitIndex],
                     variables = variables,
                 )
-                measurementCount += 1
                 if (Diagnostics.enabled) addedFactors += 1
             } else {
                 if (Diagnostics.enabled) skippedFactors += 1
@@ -142,7 +144,14 @@ class FountainDecoder {
         } else {
             null
         }
-        runIterations(BP_ITERATIONS_PER_PACKET)
+        return snapshot()
+    }
+
+    @Synchronized
+    fun pump(iterations: Int): Snapshot {
+        if (measurementCount > 0 && iterations > 0) {
+            runIterations(iterations)
+        }
         return snapshot()
     }
 
@@ -205,17 +214,20 @@ class FountainDecoder {
         edges.clear()
         for (list in variableEdges) list.clear()
         java.util.Arrays.fill(posterior, 0f)
+        residualQueue.clear()
         measurementCount = 0
+        nextMeasurementSlot = 0
         lastPacketDebug = null
         for (check in 0 until PARITY_BITS) {
-            addFactor(
+            addParityFactor(
                 observedLlr = HARD_ZERO_LLR,
                 variables = LDPC_GROUPS[check] + intArrayOf(MESSAGE_BITS + check),
             )
         }
+        scheduleAllFactors()
     }
 
-    private fun addFactor(observedLlr: Float, variables: IntArray) {
+    private fun addParityFactor(observedLlr: Float, variables: IntArray) {
         val factorIndex = factors.size
         val edgeIndexes = IntArray(variables.size)
         for (edgeOffset in variables.indices) {
@@ -226,6 +238,89 @@ class FountainDecoder {
             edgeIndexes[edgeOffset] = edgeIndex
         }
         factors += Factor(observedLlr = observedLlr.coerceIn(-LLR_CLAMP, LLR_CLAMP), edgeIndexes = edgeIndexes)
+    }
+
+    private fun addMeasurementFactor(observedLlr: Float, variables: IntArray) {
+        val slot = nextMeasurementSlot
+        nextMeasurementSlot = (nextMeasurementSlot + 1) % MAX_MEASUREMENTS
+        val factorIndex = PARITY_BITS + slot
+        replaceMeasurementFactor(
+            factorIndex = factorIndex,
+            observedLlr = observedLlr,
+            variables = variables,
+        )
+        if (measurementCount < MAX_MEASUREMENTS) {
+            measurementCount += 1
+        }
+    }
+
+    private fun replaceMeasurementFactor(factorIndex: Int, observedLlr: Float, variables: IntArray) {
+        val oldEdgeIndexes = if (factorIndex < factors.size) {
+            val oldFactor = factors[factorIndex]
+            detachFactor(factorIndex, oldFactor)
+            oldFactor.edgeIndexes
+        } else {
+            IntArray(0)
+        }
+        val edgeIndexes = IntArray(variables.size)
+        val touchedVariables = IntArray(variables.size)
+        var touchedCount = 0
+        for (edgeOffset in variables.indices) {
+            val edgeIndex = if (edgeOffset < oldEdgeIndexes.size) {
+                oldEdgeIndexes[edgeOffset]
+            } else {
+                val newEdgeIndex = edges.size
+                edges += Edge(factorIndex = factorIndex, variableIndex = variables[edgeOffset])
+                newEdgeIndex
+            }
+            val variableIndex = variables[edgeOffset]
+            val edge = edges[edgeIndex]
+            edge.factorIndex = factorIndex
+            edge.variableIndex = variableIndex
+            edge.variableToFactor = 0f
+            edge.factorToVariable = 0f
+            variableEdges[variableIndex] += edgeIndex
+            edgeIndexes[edgeOffset] = edgeIndex
+            touchedVariables[touchedCount] = variableIndex
+            touchedCount += 1
+        }
+        val factor = Factor(
+            observedLlr = observedLlr.coerceIn(-LLR_CLAMP, LLR_CLAMP),
+            edgeIndexes = edgeIndexes,
+        )
+        if (factorIndex < factors.size) {
+            factors[factorIndex] = factor
+        } else {
+            while (factors.size < factorIndex) {
+                error("Unexpected gap while adding measurement factor")
+            }
+            factors += factor
+        }
+        for (index in 0 until touchedCount) {
+            updateVariableMessages(touchedVariables[index])
+            scheduleVariableFactors(touchedVariables[index])
+        }
+        scheduleFactor(factorIndex)
+    }
+
+    private fun detachFactor(factorIndex: Int, factor: Factor) {
+        residualQueue.remove(factorIndex)
+        for (edgeIndex in factor.edgeIndexes) {
+            val edge = edges[edgeIndex]
+            removeEdgeFromVariable(edge.variableIndex, edgeIndex)
+            edge.variableToFactor = 0f
+            edge.factorToVariable = 0f
+        }
+    }
+
+    private fun removeEdgeFromVariable(variableIndex: Int, edgeIndex: Int) {
+        val list = variableEdges[variableIndex]
+        for (index in 0 until list.size) {
+            if (list[index] == edgeIndex) {
+                list.removeAt(index)
+                return
+            }
+        }
     }
 
     private fun measurementNeighbors(measurementIndex: Int): IntArray {
@@ -240,39 +335,93 @@ class FountainDecoder {
     }
 
     private fun runIterations(iterations: Int) {
-        repeat(iterations) {
-            updateFactorMessages()
-            updateVariableMessages()
+        runResidualUpdates(iterations * RESIDUAL_FACTOR_UPDATES_PER_ITERATION)
+    }
+
+    private fun runResidualUpdates(updates: Int) {
+        for (update in 0 until updates) {
+            val bestFactorIndex = residualQueue.popMax(MIN_RESIDUAL_DELTA)
+            if (bestFactorIndex < 0) return
+            updateResidualFactor(bestFactorIndex)
         }
     }
 
-    private fun updateFactorMessages() {
-        for (factor in factors) {
-            val factorTanh = tanhHalf(factor.observedLlr)
-            for (targetEdgeIndex in factor.edgeIndexes) {
-                var product = factorTanh
-                for (edgeIndex in factor.edgeIndexes) {
-                    if (edgeIndex == targetEdgeIndex) continue
-                    product *= tanhHalf(edges[edgeIndex].variableToFactor)
+    private fun scheduleAllFactors() {
+        for (factorIndex in factors.indices) {
+            scheduleFactor(factorIndex)
+        }
+    }
+
+    private fun scheduleFactor(factorIndex: Int) {
+        if (factorIndex !in factors.indices) return
+        residualQueue.update(factorIndex, factorResidual(factors[factorIndex]), MIN_RESIDUAL_DELTA)
+    }
+
+    private fun scheduleVariableFactors(variableIndex: Int) {
+        for (edgeIndex in variableEdges[variableIndex]) {
+            scheduleFactor(edges[edgeIndex].factorIndex)
+        }
+    }
+
+    private fun factorResidual(factor: Factor): Float {
+        var maxDelta = 0f
+        for (targetEdgeIndex in factor.edgeIndexes) {
+            val nextMessage = factorMessage(factor, targetEdgeIndex)
+            val delta = abs(nextMessage - edges[targetEdgeIndex].factorToVariable)
+            if (delta > maxDelta) maxDelta = delta
+        }
+        return maxDelta
+    }
+
+    private fun updateResidualFactor(factorIndex: Int) {
+        val factor = factors[factorIndex]
+        val touchedVariables = IntArray(factor.edgeIndexes.size)
+        var touchedCount = 0
+        for (targetEdgeIndex in factor.edgeIndexes) {
+            val edge = edges[targetEdgeIndex]
+            val nextMessage = factorMessage(factor, targetEdgeIndex)
+            edge.factorToVariable = (edge.factorToVariable * FACTOR_MESSAGE_DAMPING +
+                nextMessage * (1f - FACTOR_MESSAGE_DAMPING))
+                .coerceIn(-LLR_CLAMP, LLR_CLAMP)
+            var exists = false
+            for (index in 0 until touchedCount) {
+                if (touchedVariables[index] == edge.variableIndex) {
+                    exists = true
+                    break
                 }
-                edges[targetEdgeIndex].factorToVariable = (2f * atanhClamped(product))
-                    .coerceIn(-LLR_CLAMP, LLR_CLAMP)
+            }
+            if (!exists) {
+                touchedVariables[touchedCount] = edge.variableIndex
+                touchedCount += 1
             }
         }
+        for (index in 0 until touchedCount) {
+            val variableIndex = touchedVariables[index]
+            updateVariableMessages(variableIndex)
+            scheduleVariableFactors(variableIndex)
+        }
+        scheduleFactor(factorIndex)
     }
 
-    private fun updateVariableMessages() {
-        for (variableIndex in 0 until CODEWORD_BITS) {
-            val edgeList = variableEdges[variableIndex]
-            var sum = 0f
-            for (edgeIndex in edgeList) {
-                sum += edges[edgeIndex].factorToVariable
-            }
-            for (edgeIndex in edgeList) {
-                val damped = (sum - edges[edgeIndex].factorToVariable).coerceIn(-LLR_CLAMP, LLR_CLAMP)
-                edges[edgeIndex].variableToFactor =
-                    edges[edgeIndex].variableToFactor * MESSAGE_DAMPING + damped * (1f - MESSAGE_DAMPING)
-            }
+    private fun factorMessage(factor: Factor, targetEdgeIndex: Int): Float {
+        var product = tanhHalf(factor.observedLlr)
+        for (edgeIndex in factor.edgeIndexes) {
+            if (edgeIndex == targetEdgeIndex) continue
+            product *= tanhHalf(edges[edgeIndex].variableToFactor)
+        }
+        return (2f * atanhClamped(product)).coerceIn(-LLR_CLAMP, LLR_CLAMP)
+    }
+
+    private fun updateVariableMessages(variableIndex: Int) {
+        val edgeList = variableEdges[variableIndex]
+        var sum = 0f
+        for (edgeIndex in edgeList) {
+            sum += edges[edgeIndex].factorToVariable
+        }
+        for (edgeIndex in edgeList) {
+            val nextMessage = (sum - edges[edgeIndex].factorToVariable).coerceIn(-LLR_CLAMP, LLR_CLAMP)
+            edges[edgeIndex].variableToFactor =
+                edges[edgeIndex].variableToFactor * MESSAGE_DAMPING + nextMessage * (1f - MESSAGE_DAMPING)
         }
     }
 
@@ -336,6 +485,103 @@ class FountainDecoder {
         return (0.5f * kotlin.math.ln(((1f + x) / (1f - x)).toDouble())).toFloat()
     }
 
+    private class ResidualQueue(capacity: Int) {
+        private val heap = IntArray(capacity)
+        private val positions = IntArray(capacity) { -1 }
+        private val priorities = FloatArray(capacity)
+        private var size = 0
+
+        fun clear() {
+            java.util.Arrays.fill(positions, -1)
+            java.util.Arrays.fill(priorities, 0f)
+            size = 0
+        }
+
+        fun update(key: Int, priority: Float, minPriority: Float) {
+            if (key !in positions.indices) return
+            if (priority < minPriority) {
+                remove(key)
+                return
+            }
+            val position = positions[key]
+            priorities[key] = priority
+            if (position >= 0) {
+                siftUp(position)
+                val nextPosition = positions[key]
+                if (nextPosition >= 0) siftDown(nextPosition)
+            } else {
+                if (size >= heap.size) return
+                heap[size] = key
+                positions[key] = size
+                siftUp(size)
+                size += 1
+            }
+        }
+
+        fun remove(key: Int) {
+            if (key !in positions.indices) return
+            val position = positions[key]
+            if (position < 0) return
+            val lastIndex = size - 1
+            swap(position, lastIndex)
+            size -= 1
+            positions[key] = -1
+            priorities[key] = 0f
+            if (position < size) {
+                val movedKey = heap[position]
+                siftUp(position)
+                val movedPosition = positions[movedKey]
+                if (movedPosition >= 0) siftDown(movedPosition)
+            }
+        }
+
+        fun popMax(minPriority: Float): Int {
+            while (size > 0) {
+                val key = heap[0]
+                val priority = priorities[key]
+                remove(key)
+                if (priority >= minPriority) return key
+            }
+            return -1
+        }
+
+        private fun siftUp(start: Int) {
+            var index = start
+            while (index > 0) {
+                val parent = (index - 1) / 2
+                if (priorities[heap[parent]] >= priorities[heap[index]]) break
+                swap(parent, index)
+                index = parent
+            }
+        }
+
+        private fun siftDown(start: Int) {
+            var index = start
+            while (true) {
+                val left = index * 2 + 1
+                if (left >= size) return
+                val right = left + 1
+                var best = left
+                if (right < size && priorities[heap[right]] > priorities[heap[left]]) {
+                    best = right
+                }
+                if (priorities[heap[index]] >= priorities[heap[best]]) return
+                swap(index, best)
+                index = best
+            }
+        }
+
+        private fun swap(a: Int, b: Int) {
+            if (a == b) return
+            val keyA = heap[a]
+            val keyB = heap[b]
+            heap[a] = keyB
+            heap[b] = keyA
+            positions[keyA] = b
+            positions[keyB] = a
+        }
+    }
+
     companion object {
         const val MESSAGE_BITS = 36
         const val PARITY_BITS = 24
@@ -352,11 +598,13 @@ class FountainDecoder {
         private const val DEGREE_3_CUTOFF = 3_221_225_472L
         private const val DEGREE_4_CUTOFF = 3_865_470_566L
         private const val DEGREE_5_CUTOFF = 4_166_118_277L
-        private const val MAX_MEASUREMENTS = 360
-        private const val BP_ITERATIONS_PER_PACKET = 8
+        const val MAX_MEASUREMENTS = 360
         private const val LLR_CLAMP = 7.0f
         private const val HARD_ZERO_LLR = 7.0f
         private const val MESSAGE_DAMPING = 0.55f
+        private const val FACTOR_MESSAGE_DAMPING = 0.35f
+        private const val RESIDUAL_FACTOR_UPDATES_PER_ITERATION = 24
+        private const val MIN_RESIDUAL_DELTA = 0.002f
         private const val TARGET_EXPECTED_ERRORS = 0.28f
         private const val MAX_EXP = 12f
         private const val MAX_DEBUG_DEGREE = 6
