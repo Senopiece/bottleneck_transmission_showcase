@@ -647,17 +647,24 @@ private fun LiveBitCertaintyGrid(
     failed: Boolean,
     modifier: Modifier = Modifier,
 ) {
-    val bitsCount = minOf(bits.size, 36)
+    val columns = FountainDecoder.MESSAGE_WIDTH
+    val rows = FountainDecoder.MESSAGE_HEIGHT
+    val bitsCount = minOf(bits.size, columns * rows)
     Canvas(
         modifier = modifier,
     ) {
-        val gridSize = 6
         val gap = 2.dp.toPx()
-        val cell = (minOf(size.width, size.height) - gap * (gridSize - 1)) / gridSize
+        val cell = minOf(
+            (size.width - gap * (columns - 1)) / columns,
+            (size.height - gap * (rows - 1)) / rows,
+        )
+        val gridWidth = columns * cell + (columns - 1) * gap
+        val gridHeight = rows * cell + (rows - 1) * gap
+        val origin = Offset((size.width - gridWidth) * 0.5f, (size.height - gridHeight) * 0.5f)
 
-        for (row in 0 until gridSize) {
-            for (col in 0 until gridSize) {
-                val index = row * gridSize + col
+        for (row in 0 until rows) {
+            for (col in 0 until columns) {
+                val index = row * columns + col
                 if (index >= bitsCount) continue
                 val bit = bits.getOrNull(index) == true
                 val confidence = confidences.getOrNull(index) ?: 0f
@@ -670,12 +677,12 @@ private fun LiveBitCertaintyGrid(
                 }
                 drawRect(
                     color = fill,
-                    topLeft = Offset(col * (cell + gap), row * (cell + gap)),
+                    topLeft = origin + Offset(col * (cell + gap), row * (cell + gap)),
                     size = Size(cell, cell),
                 )
                 drawRect(
                     color = Color.White.copy(alpha = 0.22f),
-                    topLeft = Offset(col * (cell + gap), row * (cell + gap)),
+                    topLeft = origin + Offset(col * (cell + gap), row * (cell + gap)),
                     size = Size(cell, cell),
                     style = Stroke(width = 1.dp.toPx()),
                 )
@@ -771,20 +778,28 @@ private fun DecodedMessageGrid(
             .padding(8.dp),
     ) {
         val gap = 2.dp.toPx()
-        val cell = (minOf(size.width, size.height) - gap * 5f) / 6f
+        val columns = FountainDecoder.MESSAGE_WIDTH
+        val rows = FountainDecoder.MESSAGE_HEIGHT
+        val cell = minOf(
+            (size.width - gap * (columns - 1)) / columns,
+            (size.height - gap * (rows - 1)) / rows,
+        )
+        val gridWidth = columns * cell + (columns - 1) * gap
+        val gridHeight = rows * cell + (rows - 1) * gap
+        val origin = Offset((size.width - gridWidth) * 0.5f, (size.height - gridHeight) * 0.5f)
         val bits = message.bits
-        for (row in 0 until 6) {
-            for (col in 0 until 6) {
-                val index = row * 6 + col
+        for (row in 0 until rows) {
+            for (col in 0 until columns) {
+                val index = row * columns + col
                 val on = index < bits.size && bits[index]
                 drawRect(
                     color = if (on) Color.Black else Color.White,
-                    topLeft = Offset(col * (cell + gap), row * (cell + gap)),
+                    topLeft = origin + Offset(col * (cell + gap), row * (cell + gap)),
                     size = Size(cell, cell),
                 )
                 drawRect(
                     color = Color(0x33000000),
-                    topLeft = Offset(col * (cell + gap), row * (cell + gap)),
+                    topLeft = origin + Offset(col * (cell + gap), row * (cell + gap)),
                     size = Size(cell, cell),
                     style = Stroke(width = 1.dp.toPx()),
                 )

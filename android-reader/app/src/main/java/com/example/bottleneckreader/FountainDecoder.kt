@@ -250,7 +250,7 @@ class FountainDecoder {
         for (check in 0 until PARITY_BITS) {
             addParityFactor(
                 observedLlr = HARD_ZERO_LLR,
-                variables = LDPC_GROUPS[check] + intArrayOf(MESSAGE_BITS + check),
+                variables = parityGroup(check) + intArrayOf(MESSAGE_BITS + check),
             )
         }
         scheduleAllFactors()
@@ -357,8 +357,19 @@ class FountainDecoder {
         return SeededRng(mixMeasurementSeed(measurementIndex)).nextNeighbors(CODEWORD_BITS)
     }
 
+    private fun parityGroup(checkIndex: Int): IntArray {
+        return SeededRng(mixParitySeed(checkIndex)).nextNeighbors(MESSAGE_BITS)
+    }
+
     private fun mixMeasurementSeed(measurementIndex: Int): Long {
         var x = (LDGM_SEED + measurementIndex.toLong() * MIX_GOLDEN_RATIO) and UINT_MASK
+        x = ((x xor (x ushr 16)) * MIX_MURMUR_1) and UINT_MASK
+        x = ((x xor (x ushr 13)) * MIX_MURMUR_2) and UINT_MASK
+        return (x xor (x ushr 16)) and UINT_MASK
+    }
+
+    private fun mixParitySeed(checkIndex: Int): Long {
+        var x = (LDPC_SEED + checkIndex.toLong() * MIX_GOLDEN_RATIO) and UINT_MASK
         x = ((x xor (x ushr 16)) * MIX_MURMUR_1) and UINT_MASK
         x = ((x xor (x ushr 13)) * MIX_MURMUR_2) and UINT_MASK
         return (x xor (x ushr 16)) and UINT_MASK
@@ -632,12 +643,15 @@ class FountainDecoder {
     }
 
     companion object {
-        const val MESSAGE_BITS = 36
+        const val MESSAGE_WIDTH = 8
+        const val MESSAGE_HEIGHT = 8
+        const val MESSAGE_BITS = MESSAGE_WIDTH * MESSAGE_HEIGHT
         const val PARITY_BITS = 24
         const val CODEWORD_BITS = MESSAGE_BITS + PARITY_BITS
         const val PACKET_BITS = 5
 
         private const val LDGM_SEED = 0x12345678L
+        private const val LDPC_SEED = 0xB0771EL
         private const val UINT_MASK = 0xFFFFFFFFL
         private const val MIX_GOLDEN_RATIO = 0x9E3779B9L
         private const val MIX_MURMUR_1 = 0x85EBCA6BL
@@ -647,8 +661,8 @@ class FountainDecoder {
         private const val DEGREE_3_CUTOFF = 3_221_225_472L
         private const val DEGREE_4_CUTOFF = 3_865_470_566L
         private const val DEGREE_5_CUTOFF = 4_166_118_277L
-        const val ACTIVE_MEASUREMENTS = 60
-        const val MAX_MEASUREMENTS = 360
+        const val ACTIVE_MEASUREMENTS = 120
+        const val MAX_MEASUREMENTS = 640
         private const val LLR_CLAMP = 7.0f
         private const val HARD_ZERO_LLR = 7.0f
         private const val MESSAGE_DAMPING = 0.55f
@@ -661,31 +675,5 @@ class FountainDecoder {
         private const val MAX_DEBUG_DEGREE = 6
         private val EMPTY_DEBUG_HISTOGRAM = IntArray(0)
 
-        val LDPC_GROUPS: Array<IntArray> = arrayOf(
-            intArrayOf(15, 34, 8, 23, 30, 20, 18, 2),
-            intArrayOf(0, 5, 26, 22, 32, 19, 7, 9),
-            intArrayOf(17, 35, 33, 24, 28, 11, 10, 25),
-            intArrayOf(27, 9, 14, 12, 6, 16, 13, 4),
-            intArrayOf(7, 16, 3, 1, 20, 31, 24, 15),
-            intArrayOf(4, 27, 21, 18, 0, 1, 29, 28),
-            intArrayOf(34, 26, 12, 2, 16, 10, 33, 29),
-            intArrayOf(11, 19, 13, 8, 25, 21, 14, 1),
-            intArrayOf(30, 0, 23, 31, 24, 6, 32, 35),
-            intArrayOf(13, 17, 28, 12, 31, 3, 22, 23),
-            intArrayOf(21, 10, 9, 20, 5, 25, 29, 3),
-            intArrayOf(17, 32, 20, 14, 18, 6, 33, 2),
-            intArrayOf(18, 10, 22, 6, 11, 4, 26, 3),
-            intArrayOf(15, 12, 5, 4, 19, 24, 35, 34),
-            intArrayOf(3, 8, 35, 26, 7, 27, 25, 23),
-            intArrayOf(5, 25, 31, 32, 27, 11, 1, 30),
-            intArrayOf(29, 22, 0, 17, 33, 8, 30, 14),
-            intArrayOf(28, 15, 7, 31, 2, 8, 11, 9),
-            intArrayOf(27, 19, 34, 17, 20, 21, 0, 6),
-            intArrayOf(5, 7, 30, 10, 13, 6, 1, 23),
-            intArrayOf(5, 28, 16, 12, 22, 2, 21, 32),
-            intArrayOf(33, 13, 26, 4, 25, 15, 24, 29),
-            intArrayOf(10, 19, 32, 18, 3, 15, 35, 16),
-            intArrayOf(31, 13, 21, 17, 35, 34, 9, 14),
-        )
     }
 }
