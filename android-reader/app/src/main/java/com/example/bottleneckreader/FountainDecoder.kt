@@ -94,6 +94,26 @@ class FountainDecoder {
             }
             return unique
         }
+
+        fun nextFixedNeighbors(maxIndex: Int, degree: Int): IntArray {
+            val unique = IntArray(degree)
+            var count = 0
+            while (count < degree) {
+                val candidate = (next() % maxIndex.toLong()).toInt()
+                var exists = false
+                for (index in 0 until count) {
+                    if (unique[index] == candidate) {
+                        exists = true
+                        break
+                    }
+                }
+                if (!exists) {
+                    unique[count] = candidate
+                    count += 1
+                }
+            }
+            return unique
+        }
     }
 
     private val factors = ArrayList<Factor>(PARITY_BITS + ACTIVE_MEASUREMENTS)
@@ -358,7 +378,10 @@ class FountainDecoder {
     }
 
     private fun parityGroup(checkIndex: Int): IntArray {
-        return SeededRng(mixParitySeed(checkIndex)).nextNeighbors(MESSAGE_BITS)
+        return SeededRng(mixParitySeed(checkIndex)).nextFixedNeighbors(
+            maxIndex = MESSAGE_BITS,
+            degree = PARITY_CHECK_DEGREE,
+        )
     }
 
     private fun mixMeasurementSeed(measurementIndex: Int): Long {
@@ -646,7 +669,7 @@ class FountainDecoder {
         const val MESSAGE_WIDTH = 8
         const val MESSAGE_HEIGHT = 8
         const val MESSAGE_BITS = MESSAGE_WIDTH * MESSAGE_HEIGHT
-        const val PARITY_BITS = 24
+        const val PARITY_BITS = 32
         const val CODEWORD_BITS = MESSAGE_BITS + PARITY_BITS
         const val PACKET_BITS = 5
 
@@ -661,6 +684,7 @@ class FountainDecoder {
         private const val DEGREE_3_CUTOFF = 3_221_225_472L
         private const val DEGREE_4_CUTOFF = 3_865_470_566L
         private const val DEGREE_5_CUTOFF = 4_166_118_277L
+        private const val PARITY_CHECK_DEGREE = 8
         const val ACTIVE_MEASUREMENTS = 120
         const val MAX_MEASUREMENTS = 640
         private const val LLR_CLAMP = 7.0f

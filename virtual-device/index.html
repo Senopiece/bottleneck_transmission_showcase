@@ -292,12 +292,13 @@
     const MESSAGE_WIDTH = 8;
     const MESSAGE_HEIGHT = 8;
     const MESSAGE_BITS = MESSAGE_WIDTH * MESSAGE_HEIGHT;
-    const PARITY_BITS = 24;
+    const PARITY_BITS = 32;
     const CODEWORD_BITS = MESSAGE_BITS + PARITY_BITS;
     const PACKET_BITS = 5;
     const MEASUREMENTS_PER_PACKET = 5; // 5 measurements per transmitted packet
     const SEED1 = 0x12345678; // LDGM RNG seed
     const LDPC_SEED = 0xB0771E;
+    const PARITY_CHECK_DEGREE = 8;
 
     const DEFAULT_MESSAGE_ROWS = [
       "00000000",
@@ -350,6 +351,17 @@
         }
         return neighbors;
       }
+
+      nextFixedNeighbors(maxIndex, degree) {
+        const neighbors = [];
+        while (neighbors.length < degree) {
+          const candidate = this.next() % maxIndex;
+          if (!neighbors.includes(candidate)) {
+            neighbors.push(candidate);
+          }
+        }
+        return neighbors;
+      }
     }
 
     // Encode message via finite LDPC precode.
@@ -389,7 +401,7 @@
     }
 
     function parityGroup(checkIndex) {
-      return new SeededRNG(mixParitySeed(checkIndex)).nextNeighbors(MESSAGE_BITS);
+      return new SeededRNG(mixParitySeed(checkIndex)).nextFixedNeighbors(MESSAGE_BITS, PARITY_CHECK_DEGREE);
     }
 
     // ===== STATE & TRANSMISSION =====
