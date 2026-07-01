@@ -59,12 +59,6 @@ data class OverlayMarker(
     val sizePx: Float,
 )
 
-data class ReaderNotice(
-    val id: Long,
-    val message: String,
-    val exiting: Boolean = false,
-)
-
 data class PacketEvent(
     val id: Long,
     val timestampNs: Long,
@@ -76,7 +70,14 @@ data class DecodeProgress(
     val visible: Boolean = false,
     val failed: Boolean = false,
     val failureId: Long = 0L,
+    val phase: DecodePhase = DecodePhase.Idle,
 )
+
+enum class DecodePhase {
+    Idle,
+    Preamble,
+    Decoding,
+}
 
 data class DecodedMessage(
     val id: Long,
@@ -98,7 +99,5 @@ data class CameraProblem(
 sealed interface ReaderEvent {
     data class Detection(val frame: DetectionFrame) : ReaderEvent
     data class DecoderTiming(val elapsedMs: Float) : ReaderEvent
-    data class Notice(val message: String) : ReaderEvent
     data class CameraIssue(val problem: CameraProblem) : ReaderEvent
-    data object SlowDecoderTerminated : ReaderEvent
 }

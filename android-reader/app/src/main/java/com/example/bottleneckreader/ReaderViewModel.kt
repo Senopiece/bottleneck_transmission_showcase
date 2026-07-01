@@ -13,7 +13,6 @@ import kotlinx.coroutines.launch
 import java.util.concurrent.atomic.AtomicLong
 
 class ReaderViewModel : ViewModel() {
-    private val ids = AtomicLong(0)
     private val packetIds = AtomicLong(0)
     private val messageIds = AtomicLong(0)
     private val progressFailureIds = AtomicLong(0)
@@ -28,9 +27,6 @@ class ReaderViewModel : ViewModel() {
     private val _frame = MutableStateFlow<DetectionFrame?>(null)
     val frame: StateFlow<DetectionFrame?> = _frame.asStateFlow()
 
-    private val _notices = MutableStateFlow<List<ReaderNotice>>(emptyList())
-    val notices: StateFlow<List<ReaderNotice>> = _notices.asStateFlow()
-
     private val _packetEvents = MutableStateFlow<List<PacketEvent>>(emptyList())
     val packetEvents: StateFlow<List<PacketEvent>> = _packetEvents.asStateFlow()
 
@@ -39,6 +35,15 @@ class ReaderViewModel : ViewModel() {
 
     private val _decodedMessage = MutableStateFlow<DecodedMessage?>(null)
     val decodedMessage: StateFlow<DecodedMessage?> = _decodedMessage.asStateFlow()
+
+    private val _resultEventId = MutableStateFlow(0L)
+    val resultEventId: StateFlow<Long> = _resultEventId.asStateFlow()
+
+    private val _failureEventId = MutableStateFlow(0L)
+    val failureEventId: StateFlow<Long> = _failureEventId.asStateFlow()
+
+    private val _failureEventPhase = MutableStateFlow(DecodePhase.Idle)
+    val failureEventPhase: StateFlow<DecodePhase> = _failureEventPhase.asStateFlow()
 
     private val _liveMessageBits = MutableStateFlow(List(FountainDecoder.MESSAGE_BITS) { false })
     val liveMessageBits: StateFlow<List<Boolean>> = _liveMessageBits.asStateFlow()
@@ -63,31 +68,20 @@ class ReaderViewModel : ViewModel() {
         when (event) {
             is ReaderEvent.Detection -> onDetection(event.frame)
             is ReaderEvent.DecoderTiming -> onDecoderTiming(event.elapsedMs)
-            is ReaderEvent.Notice -> enqueueNotice(event.message)
             is ReaderEvent.CameraIssue -> {
                 _problem.value = event.problem
-                enqueueNotice(event.problem.title)
-                resetPacketDecoder(System.nanoTime())
-            }
-            ReaderEvent.SlowDecoderTerminated -> {
-                val problem = CameraProblem(
-                    title = "Decoder too slow",
-                    message = "Frame processing could not keep up with 30 fps. The camera stream was terminated.",
-                )
-                _problem.value = problem
-                enqueueNotice("Stream terminated: decoder too slow")
                 resetPacketDecoder(System.nanoTime())
             }
         }
     }
 
     fun notifyResumed(reason: String) {
-        enqueueNotice("Resumed: $reason")
+        logDebug("Resumed: $reason")
     }
 
     fun resumeCamera(reason: String) {
         _restartToken.update { it + 1 }
-        enqueueNotice("Resumed: $reason")
+        logDebug("Resumed: $reason")
     }
 
     @Synchronized
@@ -99,7 +93,6 @@ class ReaderViewModel : ViewModel() {
     fun retryCamera() {
         _problem.value = null
         _restartToken.update { it + 1 }
-        enqueueNotice("Camera restart requested")
     }
 
     fun dismissProblem() {
@@ -107,28 +100,21 @@ class ReaderViewModel : ViewModel() {
     }
 
     @Synchronized
+    fun closeDecodedMessage() {
+        _decodedMessage.value = null
+        _restartToken.update { it + 1 }
+    }
+
+    @Synchronized
     fun stopDecoding() {
         if (!_decodeProgress.value.visible && !_decodeProgress.value.failed) return
         preambleProgressPackets = 0
         _decodedMessage.value = null
-        resetLiveDecoderState()
         stopBpPump()
-        updateDecodeProgress(visible = false, confidenceProgress = 0f, failed = false)
+        hideDecodeProgressThenReset()
         packetDecoder.finishMessage()
         fountainDecoderController.reset()
-    }
-
-    private fun enqueueNotice(message: String) {
-        val id = ids.incrementAndGet()
-        _notices.update { it + ReaderNotice(id = id, message = message) }
-        viewModelScope.launch {
-            delay(NOTICE_VISIBLE_MS)
-            _notices.update { notices ->
-                notices.map { if (it.id == id) it.copy(exiting = true) else it }
-            }
-            delay(NOTICE_EXIT_MS)
-            _notices.update { notices -> notices.filterNot { it.id == id } }
-        }
+        resetLiveDecoderStateAfterExit()
     }
 
     private fun onDetection(frame: DetectionFrame) {
@@ -156,7 +142,7 @@ class ReaderViewModel : ViewModel() {
             _decodedMessage.value = null
             resetLiveDecoderState()
             stopBpPump()
-            updateDecodeProgress(visible = false, confidenceProgress = 0f, failed = false)
+            hideDecodeProgressThenReset()
             fountainDecoderController.reset()
         } else {
             stopBpPump()
@@ -212,7 +198,10 @@ class ReaderViewModel : ViewModel() {
             fountainDecoderController.startPreamble()
         }
         preambleProgressPackets = (preambleProgressPackets + 1).coerceAtMost(PREAMBLE_PROGRESS_PACKETS)
-        updateDecodeProgress(confidenceProgress = preambleUiProgress())
+        updateDecodeProgress(
+            confidenceProgress = preambleUiProgress(),
+            phase = DecodePhase.Preamble,
+        )
         logDebug("preamble=$bits progress=$preambleProgressPackets/$PREAMBLE_PROGRESS_PACKETS clock ${formatClockDebug(clockDebug)}")
         if (preambleProgressPackets >= PREAMBLE_PROGRESS_PACKETS) {
             startBpPump()
@@ -269,18 +258,20 @@ class ReaderViewModel : ViewModel() {
         }
         updateDecodeProgress(
             visible = true,
-            confidenceProgress = activeUiProgress(result.progress),
+            confidenceProgress = result.progress,
+            phase = DecodePhase.Decoding,
         )
         if (result.state == FountainDecoderController.State.Complete && messageBits != null) {
             _decodedMessage.value = DecodedMessage(
                 id = messageIds.incrementAndGet(),
                 bits = BooleanArray(messageBits.size) { index -> messageBits[index] },
             )
-            resetLiveDecoderState()
+            _resultEventId.value = progressFailureIds.incrementAndGet()
             stopBpPump()
             packetDecoder.finishMessage()
             preambleProgressPackets = 0
-            updateDecodeProgress(visible = false, confidenceProgress = 1f)
+            updateDecodeProgress(visible = false, confidenceProgress = 1f, phase = DecodePhase.Idle)
+            resetLiveDecoderStateAfterExit()
             logDebug("fountain message decoded")
         }
     }
@@ -314,21 +305,60 @@ class ReaderViewModel : ViewModel() {
         confidenceProgress: Float = _decodeProgress.value.confidenceProgress,
         failed: Boolean = false,
         failureId: Long = _decodeProgress.value.failureId,
+        phase: DecodePhase = _decodeProgress.value.phase,
     ) {
         _decodeProgress.value = DecodeProgress(
             confidenceProgress = confidenceProgress.coerceIn(0f, 1f),
             visible = visible,
             failed = failed,
             failureId = failureId,
+            phase = phase,
         )
     }
 
     private fun preambleUiProgress(): Float {
-        return PREAMBLE_UI_PROGRESS * (preambleProgressPackets.toFloat() / PREAMBLE_PROGRESS_PACKETS)
+        return preambleProgressPackets.toFloat() / PREAMBLE_PROGRESS_PACKETS
     }
 
-    private fun activeUiProgress(confidenceProgress: Float): Float {
-        return PREAMBLE_UI_PROGRESS + ACTIVE_UI_PROGRESS * confidenceProgress.coerceIn(0f, 1f)
+    private fun hideDecodeProgressThenReset(failureId: Long = _decodeProgress.value.failureId) {
+        val visibleProgress = _decodeProgress.value.confidenceProgress
+        val wasVisible = _decodeProgress.value.visible || _decodeProgress.value.failed
+        updateDecodeProgress(
+            visible = false,
+            confidenceProgress = visibleProgress,
+            failed = false,
+            failureId = failureId,
+            phase = DecodePhase.Idle,
+        )
+        if (!wasVisible) {
+            updateDecodeProgress(
+                visible = false,
+                confidenceProgress = 0f,
+                failed = false,
+                failureId = failureId,
+                phase = DecodePhase.Idle,
+            )
+            return
+        }
+        viewModelScope.launch {
+            delay(PROGRESS_EXIT_RESET_MS)
+            if (!_decodeProgress.value.visible && _decodeProgress.value.failureId == failureId) {
+                updateDecodeProgress(
+                    visible = false,
+                    confidenceProgress = 0f,
+                    failed = false,
+                    failureId = failureId,
+                    phase = DecodePhase.Idle,
+                )
+            }
+        }
+    }
+
+    private fun resetLiveDecoderStateAfterExit() {
+        viewModelScope.launch {
+            delay(PROGRESS_EXIT_RESET_MS)
+            resetLiveDecoderState()
+        }
     }
 
     private fun failProgress(message: String) {
@@ -338,18 +368,23 @@ class ReaderViewModel : ViewModel() {
         fountainDecoderController.reset()
         stopBpPump()
         _decodedMessage.value = null
-        resetLiveDecoderState()
         if (!_decodeProgress.value.visible) {
             preambleProgressPackets = 0
-            updateDecodeProgress(visible = false, confidenceProgress = 0f)
+            hideDecodeProgressThenReset()
+            resetLiveDecoderStateAfterExit()
             return
         }
         val failureId = progressFailureIds.incrementAndGet()
+        val failurePhase = if (preambleProgressPackets < PREAMBLE_PROGRESS_PACKETS) DecodePhase.Preamble else DecodePhase.Decoding
+        _failureEventPhase.value = failurePhase
+        _failureEventId.value = failureId
+        val visibleProgress = _decodeProgress.value.confidenceProgress
         updateDecodeProgress(
             visible = true,
-            confidenceProgress = 0f,
+            confidenceProgress = visibleProgress,
             failed = true,
             failureId = failureId,
+            phase = failurePhase,
         )
         viewModelScope.launch {
             delay(PROGRESS_FAILURE_VISIBLE_MS)
@@ -358,7 +393,8 @@ class ReaderViewModel : ViewModel() {
             }
             preambleProgressPackets = 0
             stopBpPump()
-            updateDecodeProgress(visible = false, confidenceProgress = 0f, failed = false, failureId = failureId)
+            hideDecodeProgressThenReset(failureId = failureId)
+            resetLiveDecoderStateAfterExit()
         }
     }
 
@@ -369,13 +405,12 @@ class ReaderViewModel : ViewModel() {
 
     private fun notifyDebugDecodeFailure(message: String, timestampNs: Long) {
         if (!Diagnostics.enabled) return
-        if (message == lastDebugFailureMessage && timestampNs - lastDebugFailureAtNs < DEBUG_FAILURE_NOTICE_COOLDOWN_NS) {
+        if (message == lastDebugFailureMessage && timestampNs - lastDebugFailureAtNs < DEBUG_FAILURE_LOG_COOLDOWN_NS) {
             return
         }
         lastDebugFailureMessage = message
         lastDebugFailureAtNs = timestampNs
         logDebug(message)
-        enqueueNotice(message)
     }
 
     private fun logDebug(message: String) {
@@ -432,14 +467,11 @@ class ReaderViewModel : ViewModel() {
         const val LED_COUNT = 5
         const val MAX_PACKET_EVENTS = 3
         const val PREAMBLE_PROGRESS_PACKETS = 3
-        const val PREAMBLE_UI_PROGRESS = 0.02f
-        const val ACTIVE_UI_PROGRESS = 0.98f
         const val BP_PUMP_INTERVAL_MS = 16L
         const val TIMING_WINDOW_SIZE = 90
-        const val NOTICE_VISIBLE_MS = 3_200L
-        const val NOTICE_EXIT_MS = 420L
-        const val PROGRESS_FAILURE_VISIBLE_MS = 760L
-        const val DEBUG_FAILURE_NOTICE_COOLDOWN_NS = 1_500_000_000L
+        const val PROGRESS_FAILURE_VISIBLE_MS = 0L
+        const val PROGRESS_EXIT_RESET_MS = 220L
+        const val DEBUG_FAILURE_LOG_COOLDOWN_NS = 1_500_000_000L
         const val DEBUG_TAG = "ReaderDecode"
     }
 }

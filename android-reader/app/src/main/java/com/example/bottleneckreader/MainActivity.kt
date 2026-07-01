@@ -1,42 +1,47 @@
 package com.example.bottleneckreader
 
 import android.Manifest
+import android.content.Context
 import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.os.VibratorManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.view.PreviewView
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.EaseInQuad
+import androidx.compose.animation.core.EaseOutQuad
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
-import androidx.compose.animation.shrinkVertically
-import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
 import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.PaddingValues
-import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.offset
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.Button
-import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -47,36 +52,63 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
-import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.text.font.Font
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import kotlinx.coroutines.delay
+
+private val PercentFontFamily = FontFamily(
+    Font(R.font.oswald, weight = FontWeight.Medium),
+)
+
+private val DarkOverlaySurface = Color(0x90101010)
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        hideNavigationBar()
         setContent {
             MaterialTheme {
                 Surface(color = Color.Black) {
                     ReaderApp()
                 }
             }
+        }
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) hideNavigationBar()
+    }
+
+    private fun hideNavigationBar() {
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        WindowInsetsControllerCompat(window, window.decorView).apply {
+            systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            hide(WindowInsetsCompat.Type.navigationBars())
         }
     }
 }
@@ -133,17 +165,31 @@ private fun ReaderApp(viewModel: ReaderViewModel = viewModel()) {
     }
 
     val frame by viewModel.frame.collectAsStateWithLifecycle()
-    val notices by viewModel.notices.collectAsStateWithLifecycle()
     val decodeProgress by viewModel.decodeProgress.collectAsStateWithLifecycle()
     val decodedMessage by viewModel.decodedMessage.collectAsStateWithLifecycle()
+    val resultEventId by viewModel.resultEventId.collectAsStateWithLifecycle()
+    val failureEventId by viewModel.failureEventId.collectAsStateWithLifecycle()
+    val failureEventPhase by viewModel.failureEventPhase.collectAsStateWithLifecycle()
     val liveMessageBits by viewModel.liveMessageBits.collectAsStateWithLifecycle()
     val liveBitConfidences by viewModel.liveBitConfidences.collectAsStateWithLifecycle()
     val liveDecoding by viewModel.liveDecoding.collectAsStateWithLifecycle()
     val problem by viewModel.problem.collectAsStateWithLifecycle()
     val restartToken by viewModel.restartToken.collectAsStateWithLifecycle()
 
+    LaunchedEffect(failureEventId) {
+        if (failureEventId != 0L) {
+            vibrate(context, VIBRATION_FAIL_MS)
+        }
+    }
+    LaunchedEffect(resultEventId) {
+        if (resultEventId != 0L) {
+            vibrate(context, VIBRATION_SUCCESS_MS)
+        }
+    }
+
     Box(Modifier.fillMaxSize().background(Color.Black)) {
-        if (cameraPermission) {
+        val result = decodedMessage
+        if (cameraPermission && result == null) {
             CameraPreview(
                 restartToken = restartToken,
                 eventSink = viewModel::onReaderEvent,
@@ -156,58 +202,59 @@ private fun ReaderApp(viewModel: ReaderViewModel = viewModel()) {
             modifier = Modifier.fillMaxSize(),
         )
 
-        DecodeProgressBelowGuide(
-            progress = decodeProgress,
-            message = decodedMessage,
-            liveMessageBits = liveMessageBits,
-            liveBitConfidences = liveBitConfidences,
-            liveDecoding = liveDecoding,
-            onStop = viewModel::stopDecoding,
-        )
+        Box(Modifier.fillMaxSize().safeDrawingPadding()) {
+            DecodeOverlay(
+                progress = decodeProgress,
+                liveMessageBits = liveMessageBits,
+                liveBitConfidences = liveBitConfidences,
+                liveDecoding = liveDecoding,
+                failureEventId = failureEventId,
+                failureEventPhase = failureEventPhase,
+                onStop = viewModel::stopDecoding,
+            )
 
-        DiagnosticsOverlay(viewModel = viewModel, frame = frame)
+            DiagnosticsOverlay(viewModel = viewModel, frame = frame)
+        }
 
-        NoticeQueue(
-            notices = notices,
-            modifier = Modifier
-                .align(Alignment.TopEnd)
-                .padding(top = 20.dp, end = 16.dp),
-        )
+        AnimatedVisibility(
+            visible = result != null,
+            enter = fadeIn(tween(180, easing = EaseInQuad)),
+            exit = slideOutHorizontally(targetOffsetX = { it }, animationSpec = tween(240)) +
+                fadeOut(tween(180)),
+        ) {
+            if (result != null) {
+                DecodeResultScreen(
+                    message = result,
+                    onBack = viewModel::closeDecodedMessage,
+                    modifier = Modifier.fillMaxSize().safeDrawingPadding(),
+                )
+            }
+        }
 
         if (!cameraPermission) {
             Text(
                 text = "Camera permission required",
                 color = Color.White,
-                modifier = Modifier.align(Alignment.Center),
+                modifier = Modifier
+                    .align(Alignment.Center)
+                    .safeDrawingPadding(),
             )
         }
-    }
 
-    val activeProblem = problem
-    if (activeProblem != null) {
-        AlertDialog(
-            onDismissRequest = viewModel::dismissProblem,
-            title = { Text(activeProblem.title) },
-            text = { Text(activeProblem.message) },
-            confirmButton = {
-                Button(
-                    onClick = {
-                        if (!cameraPermission) {
-                            permissionLauncher.launch(Manifest.permission.CAMERA)
-                        } else {
-                            viewModel.retryCamera()
-                        }
-                    },
-                ) {
-                    Text(if (cameraPermission) "Retry camera" else "Grant permission")
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = viewModel::dismissProblem) {
-                    Text("Dismiss")
-                }
-            },
-        )
+        val activeProblem = problem
+        if (activeProblem != null) {
+            Text(
+                text = "${activeProblem.title}\n${activeProblem.message}",
+                color = Color.White,
+                fontSize = 18.sp,
+                lineHeight = 24.sp,
+                fontWeight = FontWeight.Bold,
+                modifier = Modifier
+                    .align(Alignment.Center)
+                    .safeDrawingPadding()
+                    .padding(28.dp),
+            )
+        }
     }
 }
 
@@ -332,107 +379,264 @@ private fun DetectionOverlay(
 }
 
 @Composable
-private fun DecodeProgressBelowGuide(
+private fun DecodeOverlay(
     progress: DecodeProgress,
-    message: DecodedMessage?,
     liveMessageBits: List<Boolean>,
     liveBitConfidences: List<Float>,
     liveDecoding: Boolean,
+    failureEventId: Long,
+    failureEventPhase: DecodePhase,
     onStop: () -> Unit,
 ) {
-    val haptic = LocalHapticFeedback.current
-    LaunchedEffect(progress.failureId) {
-        if (progress.failed && progress.failureId != 0L) {
-            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+    val preambleActive = progress.visible && progress.phase == DecodePhase.Preamble
+    var preambleExitFailed by remember { mutableStateOf(false) }
+    LaunchedEffect(failureEventId, failureEventPhase) {
+        if (failureEventId != 0L && failureEventPhase == DecodePhase.Preamble) {
+            preambleExitFailed = true
+            delay(160L)
+            preambleExitFailed = false
         }
     }
+    val preambleVisible = preambleActive && !progress.failed
+    var preambleDisplayProgress by remember { mutableStateOf(0f) }
+    LaunchedEffect(preambleActive, progress.confidenceProgress) {
+        if (preambleActive) {
+            preambleDisplayProgress = progress.confidenceProgress
+        }
+    }
+    val decodeOnScreen = progress.visible && progress.phase == DecodePhase.Decoding
+    val decodeActive = decodeOnScreen && !progress.failed
+    var decodeSnapshot by remember {
+        mutableStateOf(
+            DecodeDisplaySnapshot(
+                bits = liveMessageBits,
+                confidences = liveBitConfidences,
+                progress = progress.confidenceProgress,
+                showButton = true,
+            ),
+        )
+    }
+    LaunchedEffect(decodeActive, liveMessageBits, liveBitConfidences, progress.confidenceProgress) {
+        if (decodeActive) {
+            decodeSnapshot = DecodeDisplaySnapshot(
+                bits = liveMessageBits,
+                confidences = liveBitConfidences,
+                progress = progress.confidenceProgress,
+                showButton = true,
+            )
+        }
+    }
+    var decodeExitFailed by remember { mutableStateOf(false) }
+    LaunchedEffect(failureEventId, failureEventPhase) {
+        if (failureEventId != 0L && failureEventPhase == DecodePhase.Decoding) {
+            decodeExitFailed = true
+            delay(160L)
+            decodeExitFailed = false
+        }
+    }
+    val decodeVisible = decodeOnScreen
+    val decodeFailed = progress.failed || decodeExitFailed
+    val decodeDisplay = if (!decodeActive) {
+        decodeSnapshot
+    } else {
+        DecodeDisplaySnapshot(
+            bits = liveMessageBits,
+            confidences = liveBitConfidences,
+            progress = progress.confidenceProgress,
+            showButton = true,
+        )
+    }
+    val frozenDecodeDisplay = if (decodeFailed) {
+        decodeSnapshot
+    } else {
+        decodeDisplay
+    }
 
-    BoxWithConstraints(Modifier.fillMaxSize()) {
-        val roiWidth = maxWidth * ReaderRoi.WIDTH_FRACTION
-        val roiHeight = (roiWidth * ReaderRoi.ROI_ASPECT_RATIO).coerceAtMost(maxHeight)
-        val topOffset = (maxHeight - roiHeight) / 2 + roiHeight + 10.dp
-        Column(
+    Box(Modifier.fillMaxSize()) {
+        AnimatedVisibility(
+            visible = preambleVisible,
             modifier = Modifier
-                .align(Alignment.TopEnd)
-                .padding(top = topOffset, end = 12.dp),
-            verticalArrangement = Arrangement.spacedBy(6.dp),
-            horizontalAlignment = Alignment.End,
+                .align(Alignment.Center)
+                .graphicsLayer { translationY = 76.dp.toPx() },
+            enter = fadeIn(tween(80, easing = EaseInQuad)) +
+                slideInVertically(
+                    initialOffsetY = { it / 8 },
+                    animationSpec = tween(80, easing = EaseOutQuad),
+                ),
+            exit = fadeOut(tween(80, easing = EaseInQuad)) +
+                slideOutVertically(
+                    targetOffsetY = { it / 8 },
+                    animationSpec = tween(80, easing = EaseOutQuad),
+                ),
         ) {
-            if (progress.visible) {
-                LiveBitCertaintyCard(
-                    progress = progress,
-                    liveMessageBits = liveMessageBits,
-                    liveBitConfidences = liveBitConfidences,
-                    liveDecoding = liveDecoding,
-                    onStop = onStop,
-                )
-            } else if (message != null) {
-                DecodedMessageGrid(message = message)
-            }
+            PreambleStatus(
+                progress = preambleDisplayProgress,
+                failed = preambleExitFailed,
+            )
+        }
+
+        AnimatedVisibility(
+            visible = decodeVisible,
+            modifier = Modifier.fillMaxSize(),
+            enter = fadeIn(tween(80, easing = EaseInQuad)) +
+                slideInVertically(
+                    initialOffsetY = { it / 24 },
+                    animationSpec = tween(80, easing = EaseOutQuad),
+                ),
+            exit = fadeOut(tween(80, easing = EaseInQuad)) +
+                slideOutVertically(
+                    targetOffsetY = { it / 24 },
+                    animationSpec = tween(80, easing = EaseOutQuad),
+                ),
+        ) {
+            DecodeBottomControls(
+                display = frozenDecodeDisplay,
+                failed = decodeFailed,
+                onStop = onStop,
+            )
         }
     }
 }
 
+private data class DecodeDisplaySnapshot(
+    val bits: List<Boolean>,
+    val confidences: List<Float>,
+    val progress: Float,
+    val showButton: Boolean,
+)
+
 @Composable
-private fun LiveBitCertaintyCard(
-    progress: DecodeProgress,
-    liveMessageBits: List<Boolean>,
-    liveBitConfidences: List<Float>,
-    liveDecoding: Boolean,
+private fun PreambleStatus(
+    progress: Float,
+    failed: Boolean,
+) {
+    val textColor = if (failed) Color(0xFFFF453A) else Color.White.copy(alpha = 0.92f)
+    val labelColor = if (failed) Color(0xFFFF453A) else Color.White.copy(alpha = 0.54f)
+    Column(
+        modifier = Modifier
+            .width(128.dp)
+            .shadow(
+                elevation = 8.dp,
+                shape = RoundedCornerShape(10.dp),
+                ambientColor = Color.Black.copy(alpha = 0.18f),
+                spotColor = Color.Black.copy(alpha = 0.26f),
+            )
+            .background(DarkOverlaySurface, RoundedCornerShape(10.dp))
+            .padding(horizontal = 18.dp, vertical = 3.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy((-5).dp),
+    ) {
+        Text(
+            text = "PREAMBLE",
+            color = labelColor,
+            fontSize = 12.sp,
+            fontWeight = FontWeight.Bold,
+        )
+        PercentText(
+            text = "${(progress.coerceIn(0f, 1f) * 100f).toInt()}%",
+            color = textColor,
+        )
+    }
+}
+
+@Composable
+private fun PercentText(
+    text: String,
+    color: Color,
+    modifier: Modifier = Modifier,
+    lineHeight: TextUnit = 34.sp,
+) {
+    Text(
+        text = text,
+        modifier = modifier,
+        color = color,
+        fontSize = 30.sp,
+        lineHeight = lineHeight,
+        fontFamily = PercentFontFamily,
+        fontWeight = FontWeight.Medium,
+    )
+}
+
+@Composable
+private fun DecodeBottomControls(
+    display: DecodeDisplaySnapshot,
+    failed: Boolean,
     onStop: () -> Unit,
 ) {
-    val background = if (progress.failed) Color(0xFFFF3B30) else Color.White
-    val foreground = if (progress.failed) Color.White else Color.Black
-    val completion = progress.confidenceProgress.coerceIn(0f, 1f)
-    Box(
-        modifier = Modifier
-            .background(background, RoundedCornerShape(6.dp))
-            .padding(12.dp)
-            .widthIn(max = 220.dp),
-    ) {
-        Column(
-            modifier = Modifier.fillMaxWidth(),
-            verticalArrangement = Arrangement.spacedBy(10.dp),
+    var redFlash by remember { mutableStateOf(false) }
+    LaunchedEffect(failed) {
+        if (failed) {
+            redFlash = true
+            delay(45L)
+            redFlash = false
+        } else {
+            redFlash = false
+        }
+    }
+    val flashFailed = failed || redFlash
+    Box(Modifier.fillMaxSize()) {
+        Row(
+            modifier = Modifier
+                .align(Alignment.BottomStart)
+                .padding(start = 54.dp, bottom = 104.dp),
+            verticalAlignment = Alignment.Bottom,
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            Text(
-                text = when {
-                    progress.failed -> "Decode failed"
-                    liveDecoding -> "Live BP certainty"
-                    else -> "Waiting for confidence"
-                },
-                color = foreground,
-                fontSize = 16.sp,
-                fontWeight = FontWeight.Bold,
-            )
-
             LiveBitCertaintyGrid(
-                bits = liveMessageBits,
-                confidences = liveBitConfidences,
-                failed = progress.failed,
+                bits = display.bits,
+                confidences = display.confidences,
+                failed = flashFailed,
+                modifier = Modifier.size(104.dp),
             )
-
-            Text(
-                text = if (progress.failed) "Tap cancel to reset" else "Confidence ${(completion * 100f).toInt()}%",
-                color = foreground,
-                fontSize = 14.sp,
+            PercentText(
+                text = "${(display.progress.coerceIn(0f, 1f) * 100f).toInt()}%",
+                color = if (flashFailed) Color(0xCCFF453A) else Color.White.copy(alpha = 0.88f),
+                lineHeight = 30.sp,
             )
+        }
 
-            LinearProgressIndicator(
-                progress = completion,
-                modifier = Modifier.fillMaxWidth(),
-                color = if (progress.failed) Color.White else Color.Black,
-                trackColor = if (progress.failed) Color.White.copy(alpha = 0.28f) else Color.Black.copy(alpha = 0.16f),
-            )
-
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.End,
+        if (display.showButton) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .padding(end = 54.dp, bottom = 176.dp)
+                    .size(50.dp)
+                    .shadow(
+                        elevation = 8.dp,
+                        shape = CircleShape,
+                        ambientColor = Color.Black.copy(alpha = 0.16f),
+                        spotColor = Color.Black.copy(alpha = 0.24f),
+                    )
+                    .background(DarkOverlaySurface, CircleShape)
+                    .clickable(onClick = onStop),
+                contentAlignment = Alignment.Center,
             ) {
-                Button(onClick = onStop) {
-                    Text(if (progress.failed) "Reset" else "Cancel")
-                }
+                CancelIcon()
             }
         }
+    }
+
+}
+
+@Composable
+private fun CancelIcon(modifier: Modifier = Modifier) {
+    Canvas(modifier = modifier.size(22.dp)) {
+        val strokeWidth = 2.dp.toPx()
+        val inset = 4.2.dp.toPx()
+        drawLine(
+            color = Color.White,
+            start = Offset(inset, inset),
+            end = Offset(size.width - inset, size.height - inset),
+            strokeWidth = strokeWidth,
+            cap = StrokeCap.Round,
+        )
+        drawLine(
+            color = Color.White,
+            start = Offset(size.width - inset, inset),
+            end = Offset(inset, size.height - inset),
+            strokeWidth = strokeWidth,
+            cap = StrokeCap.Round,
+        )
     }
 }
 
@@ -441,13 +645,11 @@ private fun LiveBitCertaintyGrid(
     bits: List<Boolean>,
     confidences: List<Float>,
     failed: Boolean,
+    modifier: Modifier = Modifier,
 ) {
     val bitsCount = minOf(bits.size, 36)
     Canvas(
-        modifier = Modifier
-            .width(152.dp)
-            .height(152.dp)
-            .background(Color(0xFFF2F2F2), RoundedCornerShape(4.dp)),
+        modifier = modifier,
     ) {
         val gridSize = 6
         val gap = 2.dp.toPx()
@@ -461,10 +663,10 @@ private fun LiveBitCertaintyGrid(
                 val confidence = confidences.getOrNull(index) ?: 0f
                 val intensity = confidence.coerceIn(0f, 1f)
                 val fill = when {
-                    failed -> Color(0xFFCCCCCC)
-                    intensity < 0.40f -> Color(0xFFB0B0B0)
-                    bit -> Color.Black.copy(alpha = 0.35f + intensity * 0.65f)
-                    else -> Color.White.copy(alpha = 0.35f + intensity * 0.65f)
+                    failed -> Color(0x99FF453A)
+                    intensity < 0.40f -> Color(0xFFB8BDC6).copy(alpha = 0.70f)
+                    bit -> Color.Black.copy(alpha = 0.34f + intensity * 0.58f)
+                    else -> Color.White.copy(alpha = 0.62f + intensity * 0.34f)
                 }
                 drawRect(
                     color = fill,
@@ -472,7 +674,7 @@ private fun LiveBitCertaintyGrid(
                     size = Size(cell, cell),
                 )
                 drawRect(
-                    color = Color(0x55000000),
+                    color = Color.White.copy(alpha = 0.22f),
                     topLeft = Offset(col * (cell + gap), row * (cell + gap)),
                     size = Size(cell, cell),
                     style = Stroke(width = 1.dp.toPx()),
@@ -483,11 +685,88 @@ private fun LiveBitCertaintyGrid(
 }
 
 @Composable
-private fun DecodedMessageGrid(message: DecodedMessage) {
+private fun DecodeResultScreen(
+    message: DecodedMessage,
+    onBack: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Box(
+        modifier = modifier.background(Color.Black),
+        contentAlignment = Alignment.Center,
+    ) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(24.dp),
+        ) {
+            DecodedMessageGrid(
+                message = message,
+                modifier = Modifier.size(220.dp),
+            )
+            Box(
+                modifier = Modifier
+                    .size(54.dp)
+                    .shadow(
+                        elevation = 10.dp,
+                        shape = CircleShape,
+                        ambientColor = Color.Black.copy(alpha = 0.18f),
+                        spotColor = Color.Black.copy(alpha = 0.30f),
+                    )
+                    .background(Color.White.copy(alpha = 0.90f), CircleShape)
+                    .clickable(onClick = onBack),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    text = "←",
+                    color = Color.Transparent,
+                    fontSize = 30.sp,
+                    fontWeight = FontWeight.Bold,
+                )
+                BackArrowIcon()
+            }
+        }
+    }
+
+}
+
+@Composable
+private fun BackArrowIcon(modifier: Modifier = Modifier) {
+    Canvas(modifier = modifier.size(25.dp)) {
+        val stroke = 2.2.dp.toPx()
+        val y = size.height * 0.5f
+        val left = size.width * 0.22f
+        val right = size.width * 0.78f
+        val wing = size.width * 0.24f
+        drawLine(
+            color = Color(0xFF151515),
+            start = Offset(right, y),
+            end = Offset(left, y),
+            strokeWidth = stroke,
+            cap = StrokeCap.Round,
+        )
+        drawLine(
+            color = Color(0xFF151515),
+            start = Offset(left, y),
+            end = Offset(left + wing, y - wing),
+            strokeWidth = stroke,
+            cap = StrokeCap.Round,
+        )
+        drawLine(
+            color = Color(0xFF151515),
+            start = Offset(left, y),
+            end = Offset(left + wing, y + wing),
+            strokeWidth = stroke,
+            cap = StrokeCap.Round,
+        )
+    }
+}
+
+@Composable
+private fun DecodedMessageGrid(
+    message: DecodedMessage,
+    modifier: Modifier = Modifier,
+) {
     Canvas(
-        modifier = Modifier
-            .width(126.dp)
-            .height(126.dp)
+        modifier = modifier
             .background(Color.White, RoundedCornerShape(3.dp))
             .padding(8.dp),
     ) {
@@ -579,46 +858,6 @@ private object AcquireGuideGeometry {
 
     val slotFractions: FloatArray = FloatArray(5) { index ->
         (firstLedOffsetMm + index * stepMm) / markerDistanceMm
-    }
-}
-
-@Composable
-private fun NoticeQueue(
-    notices: List<ReaderNotice>,
-    modifier: Modifier = Modifier,
-) {
-    Column(
-        modifier = modifier,
-        verticalArrangement = Arrangement.spacedBy(8.dp),
-        horizontalAlignment = Alignment.End,
-    ) {
-        notices.forEach { notice ->
-            AnimatedVisibility(
-                visible = !notice.exiting,
-                enter = slideInHorizontally(
-                    initialOffsetX = { it + 80 },
-                    animationSpec = tween(220),
-                ) + fadeIn(tween(220)),
-                exit = slideOutHorizontally(
-                    targetOffsetX = { it + 80 },
-                    animationSpec = tween(340),
-                ) + fadeOut(tween(280)) + shrinkVertically(tween(420)),
-            ) {
-                Box(
-                    modifier = Modifier
-                        .widthIn(max = 300.dp)
-                        .background(Color(0xDD090A0C), RoundedCornerShape(7.dp))
-                        .padding(PaddingValues(horizontal = 12.dp, vertical = 9.dp)),
-                ) {
-                    Text(
-                        text = notice.message,
-                        color = Color(0xFFE8EAEE),
-                        fontSize = 13.sp,
-                        lineHeight = 17.sp,
-                    )
-                }
-            }
-        }
     }
 }
 
@@ -736,3 +975,28 @@ private data class RotatedPoint(
     val x: Float,
     val y: Float,
 )
+
+private fun vibrate(context: Context, durationMs: Long) {
+    val vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+        val manager = context.getSystemService(VibratorManager::class.java)
+        manager.defaultVibrator
+    } else {
+        @Suppress("DEPRECATION")
+        context.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+    }
+    if (!vibrator.hasVibrator()) return
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        vibrator.vibrate(
+            VibrationEffect.createOneShot(
+                durationMs,
+                VibrationEffect.DEFAULT_AMPLITUDE,
+            ),
+        )
+    } else {
+        @Suppress("DEPRECATION")
+        vibrator.vibrate(durationMs)
+    }
+}
+
+private const val VIBRATION_SUCCESS_MS = 55L
+private const val VIBRATION_FAIL_MS = 120L

@@ -98,11 +98,6 @@ class CameraReader(
         val nextAnalyzer = FrameAnalyzer(
             decoder = decoder,
             eventSink = eventSink,
-            stopCamera = {
-                ContextCompat.getMainExecutor(context).execute {
-                    stop()
-                }
-            },
         )
         analyzer = nextAnalyzer
         analysis.setAnalyzer(analyzerExecutor, nextAnalyzer)
@@ -143,13 +138,8 @@ class CameraReader(
     private class FrameAnalyzer(
         private val decoder: LedFrameDecoder,
         private val eventSink: (ReaderEvent) -> Unit,
-        private val stopCamera: () -> Unit,
     ) : ImageAnalysis.Analyzer {
         private var stopped = false
-        private var firstFrameAtNs = 0L
-        private var slowSinceNs = 0L
-        private var warned = false
-        private var averageMs = 0.0
 
         fun stop() {
             stopped = true
@@ -185,15 +175,6 @@ class CameraReader(
                 } else {
                     eventSink(ReaderEvent.Detection(frame))
                 }
-            } catch (error: Throwable) {
-                eventSink(
-                    ReaderEvent.CameraIssue(
-                        CameraProblem(
-                            title = "Decoder failed",
-                            message = error.message ?: error::class.java.simpleName,
-                        ),
-                    ),
-                )
             } finally {
                 image.close()
             }
@@ -203,51 +184,6 @@ class CameraReader(
             if (Diagnostics.enabled) {
                 eventSink(ReaderEvent.DecoderTiming(elapsedMs))
             }
-            updateWatchdog((elapsedNs / 1_000_000).coerceAtLeast(0))
-        }
-
-        private fun updateWatchdog(elapsedMs: Long) {
-            val now = System.nanoTime()
-            if (firstFrameAtNs == 0L) firstFrameAtNs = now
-            averageMs = if (averageMs == 0.0) {
-                elapsedMs.toDouble()
-            } else {
-                averageMs * 0.88 + elapsedMs * 0.12
-            }
-
-            if (now - firstFrameAtNs < STARTUP_GRACE_NS) {
-                return
-            }
-
-            val overloaded = averageMs > TERMINATE_AVERAGE_MS || elapsedMs > TERMINATE_SINGLE_FRAME_MS
-            if (overloaded) {
-                if (slowSinceNs == 0L) slowSinceNs = now
-                if (!warned && now - slowSinceNs > WARNING_AFTER_NS) {
-                    warned = true
-                    eventSink(
-                        ReaderEvent.Notice(
-                            "Decoder is slow: avg ${averageMs.toInt()} ms/frame",
-                        ),
-                    )
-                }
-            } else {
-                slowSinceNs = 0L
-                warned = false
-            }
-
-            if (slowSinceNs != 0L && now - slowSinceNs > TERMINATE_AFTER_NS) {
-                stopped = true
-                eventSink(ReaderEvent.SlowDecoderTerminated)
-                stopCamera()
-            }
-        }
-
-        private companion object {
-            const val TERMINATE_AVERAGE_MS = 85.0
-            const val TERMINATE_SINGLE_FRAME_MS = 240L
-            const val STARTUP_GRACE_NS = 3_000_000_000L
-            const val WARNING_AFTER_NS = 2_500_000_000L
-            const val TERMINATE_AFTER_NS = 8_000_000_000L
         }
     }
 }
