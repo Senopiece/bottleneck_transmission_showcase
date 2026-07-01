@@ -67,8 +67,11 @@ class PacketClockDecoder {
     private var preambleIntervalCount = 0
     private var preambleMisses = 0
     private var lastPreambleScores: FloatArray? = null
-    private var pendingPreambleEdgeAtNs = 0L
-    private var pendingPreambleEdgeScore = 0f
+    private val preambleObservedAtNs = LongArray(PREAMBLE.size)
+    private val preambleObservedWeights = FloatArray(PREAMBLE.size)
+    private val pendingPreambleEdgeAtNs = LongArray(MAX_PENDING_PREAMBLE_EDGES)
+    private val pendingPreambleEdgeScores = FloatArray(MAX_PENDING_PREAMBLE_EDGES)
+    private var pendingPreambleEdgeCount = 0
     private var lastPreambleEstimateMode = ""
     private var lastPreambleFirstIntervalNs = 0L
     private var lastPreambleSecondIntervalNs = 0L
@@ -143,7 +146,10 @@ class PacketClockDecoder {
             matchesSoft(scores, expected) -> {
                 preambleMisses = 0
                 preambleStarted = true
-                val observedAtNs = consumePreambleEdgeTimestampOr(timestampNs)
+                val edge = consumePreambleEdgeTimestampOr(timestampNs)
+                val observedAtNs = edge.timestampNs
+                preambleObservedAtNs[preambleIndex] = observedAtNs
+                preambleObservedWeights[preambleIndex] = edge.weight
                 var lastIntervalNs = 0L
                 if (lastPreambleAtNs != 0L) {
                     lastIntervalNs = observedAtNs - lastPreambleAtNs
@@ -152,22 +158,17 @@ class PacketClockDecoder {
                         preambleIntervalCount += 1
                     }
                 }
-                val previousPreambleAtNs = lastPreambleAtNs
                 lastPreambleAtNs = observedAtNs
                 preambleIndex += 1
                 var debugInfo: DebugInfo? = null
 
                 if (preambleIndex == PREAMBLE.size) {
-                    val measuredPeriodNs = estimatePreamblePeriod()
-                    periodNs = stabilizeMeasuredPeriod(measuredPeriodNs)
-                    val finalPreambleAtNs = correctedFinalPreambleAt(
-                        observedFinalAtNs = observedAtNs,
-                        previousPreambleAtNs = previousPreambleAtNs,
-                        lastIntervalNs = lastIntervalNs,
-                    )
+                    val timing = estimatePreambleTiming()
+                    periodNs = timing.periodNs
+                    val finalPreambleAtNs = timing.finalPreambleAtNs
                     debugInfo = DebugInfo(
                         periodNs = periodNs,
-                        measuredPeriodNs = measuredPeriodNs,
+                        measuredPeriodNs = timing.periodNs,
                         preambleEstimateMode = lastPreambleEstimateMode,
                         preambleFirstIntervalNs = lastPreambleFirstIntervalNs,
                         preambleSecondIntervalNs = lastPreambleSecondIntervalNs,
@@ -236,17 +237,63 @@ class PacketClockDecoder {
         if (changedCount == 0) return
 
         val edgeScore = changedScore / changedCount - unexpectedScore * PREAMBLE_UNEXPECTED_EDGE_PENALTY
-        if (edgeScore >= PREAMBLE_EDGE_SCORE_THRESHOLD && edgeScore > pendingPreambleEdgeScore) {
-            pendingPreambleEdgeAtNs = timestampNs
-            pendingPreambleEdgeScore = edgeScore
+        if (edgeScore >= PREAMBLE_EDGE_SCORE_THRESHOLD) {
+            pushPreambleEdgeCandidate(timestampNs, edgeScore)
         }
     }
 
-    private fun consumePreambleEdgeTimestampOr(fallbackNs: Long): Long {
-        val timestampNs = if (pendingPreambleEdgeAtNs != 0L) pendingPreambleEdgeAtNs else fallbackNs
-        pendingPreambleEdgeAtNs = 0L
-        pendingPreambleEdgeScore = 0f
-        return timestampNs
+    private fun pushPreambleEdgeCandidate(timestampNs: Long, score: Float) {
+        if (pendingPreambleEdgeCount < MAX_PENDING_PREAMBLE_EDGES) {
+            pendingPreambleEdgeAtNs[pendingPreambleEdgeCount] = timestampNs
+            pendingPreambleEdgeScores[pendingPreambleEdgeCount] = score
+            pendingPreambleEdgeCount += 1
+            return
+        }
+
+        var weakestIndex = 0
+        var weakestScore = pendingPreambleEdgeScores[0]
+        for (index in 1 until MAX_PENDING_PREAMBLE_EDGES) {
+            val candidateScore = pendingPreambleEdgeScores[index]
+            if (candidateScore < weakestScore) {
+                weakestScore = candidateScore
+                weakestIndex = index
+            }
+        }
+        if (score > weakestScore) {
+            pendingPreambleEdgeAtNs[weakestIndex] = timestampNs
+            pendingPreambleEdgeScores[weakestIndex] = score
+        }
+    }
+
+    private data class PreambleEdge(val timestampNs: Long, val weight: Float)
+
+    private fun consumePreambleEdgeTimestampOr(fallbackNs: Long): PreambleEdge {
+        if (pendingPreambleEdgeCount == 0) {
+            return PreambleEdge(timestampNs = fallbackNs, weight = 1f)
+        }
+
+        var weightedTimestamp = 0.0
+        var weightSum = 0f
+        for (index in 0 until pendingPreambleEdgeCount) {
+            val weight = pendingPreambleEdgeScores[index]
+            weightedTimestamp += pendingPreambleEdgeAtNs[index].toDouble() * weight.toDouble()
+            weightSum += weight
+        }
+        clearPendingPreambleEdges()
+        return if (weightSum > 0f) {
+            PreambleEdge(
+                timestampNs = (weightedTimestamp / weightSum).toLong(),
+                weight = weightSum,
+            )
+        } else {
+            PreambleEdge(timestampNs = fallbackNs, weight = 1f)
+        }
+    }
+
+    private fun clearPendingPreambleEdges() {
+        java.util.Arrays.fill(pendingPreambleEdgeAtNs, 0L)
+        java.util.Arrays.fill(pendingPreambleEdgeScores, 0f)
+        pendingPreambleEdgeCount = 0
     }
 
     private fun matchesSoft(scores: FloatArray, expected: String): Boolean {
@@ -266,60 +313,54 @@ class PacketClockDecoder {
         return true
     }
 
-    private fun stabilizeMeasuredPeriod(measuredPeriodNs: Long): Long {
-        val clamped = measuredPeriodNs.coerceIn(MIN_PERIOD_NS, MAX_PERIOD_NS)
-        var best = ALLOWED_PERIODS_NS[0]
-        var bestDistance = kotlin.math.abs(clamped - best)
-        for (index in 1 until ALLOWED_PERIODS_NS.size) {
-            val candidate = ALLOWED_PERIODS_NS[index]
-            val distance = kotlin.math.abs(clamped - candidate)
-            if (distance < bestDistance) {
-                best = candidate
-                bestDistance = distance
-            }
-        }
-        return best
-    }
+    private data class PreambleTiming(val periodNs: Long, val finalPreambleAtNs: Long)
 
-    private fun estimatePreamblePeriod(): Long {
+    private fun estimatePreambleTiming(): PreambleTiming {
         lastPreambleEstimateMode = "allowed_default"
         lastPreambleFirstIntervalNs = 0L
         lastPreambleSecondIntervalNs = 0L
-        if (preambleIntervalCount == 0) return DEFAULT_PERIOD_NS
+        if (preambleIntervalCount == 0) {
+            val fallbackFinalAtNs = preambleObservedAtNs[PREAMBLE.lastIndex].takeIf { it != 0L } ?: lastPreambleAtNs
+            return PreambleTiming(periodNs = DEFAULT_PERIOD_NS, finalPreambleAtNs = fallbackFinalAtNs)
+        }
         lastPreambleFirstIntervalNs = preambleIntervalsNs[0]
         if (preambleIntervalCount > 1) {
             lastPreambleSecondIntervalNs = preambleIntervalsNs[1]
         }
 
         var bestPeriod = ALLOWED_PERIODS_NS[0]
-        var bestError = Long.MAX_VALUE
+        var bestFinalAtNs = preambleObservedAtNs[PREAMBLE.lastIndex]
+        var bestError = Double.POSITIVE_INFINITY
         for (candidate in ALLOWED_PERIODS_NS) {
-            var error = 0L
-            for (index in 0 until preambleIntervalCount) {
-                error += kotlin.math.abs(preambleIntervalsNs[index] - candidate)
+            var weightedAnchorSum = 0.0
+            var weightSum = 0.0
+            for (ordinal in 1 until PREAMBLE.size) {
+                val observedAtNs = preambleObservedAtNs[ordinal]
+                if (observedAtNs == 0L) continue
+                val weight = preambleObservedWeights[ordinal].coerceAtLeast(0.25f).toDouble()
+                val anchorAtFinal = observedAtNs + (PREAMBLE.lastIndex - ordinal) * candidate
+                weightedAnchorSum += anchorAtFinal.toDouble() * weight
+                weightSum += weight
+            }
+            if (weightSum <= 0.0) continue
+
+            val finalAtNs = weightedAnchorSum / weightSum
+            var error = 0.0
+            for (ordinal in 1 until PREAMBLE.size) {
+                val observedAtNs = preambleObservedAtNs[ordinal]
+                if (observedAtNs == 0L) continue
+                val weight = preambleObservedWeights[ordinal].coerceAtLeast(0.25f).toDouble()
+                val predictedAtNs = finalAtNs - (PREAMBLE.lastIndex - ordinal) * candidate
+                error += kotlin.math.abs(observedAtNs.toDouble() - predictedAtNs) * weight
             }
             if (error < bestError) {
                 bestError = error
                 bestPeriod = candidate
+                bestFinalAtNs = finalAtNs.toLong()
             }
         }
         lastPreambleEstimateMode = "allowed_${1_000_000_000L / bestPeriod}hz"
-        return bestPeriod
-    }
-
-    private fun correctedFinalPreambleAt(
-        observedFinalAtNs: Long,
-        previousPreambleAtNs: Long,
-        lastIntervalNs: Long,
-    ): Long {
-        if (previousPreambleAtNs == 0L || lastIntervalNs == 0L) return observedFinalAtNs
-        val expectedFinalAtNs = previousPreambleAtNs + periodNs
-        val observedError = kotlin.math.abs(observedFinalAtNs - expectedFinalAtNs)
-        return if (observedError > periodNs * PREAMBLE_ANCHOR_ERROR_PERCENT / 100L) {
-            expectedFinalAtNs
-        } else {
-            observedFinalAtNs
-        }
+        return PreambleTiming(periodNs = bestPeriod, finalPreambleAtNs = bestFinalAtNs)
     }
 
     private fun acceptActive(scores: FloatArray?, timestampNs: Long): Result? {
@@ -431,7 +472,7 @@ class PacketClockDecoder {
                 val average = symbolScoreSums[index] / symbolWeightSum
                 val peak = symbolScoreMax[index]
                 averages[index] = average
-                val rawLlr = scoreToRawLlr(average = average, peak = peak, onThreshold = onThreshold)
+                val rawLlr = scoreToRawLlr(average = average, onThreshold = onThreshold)
                 bitLlrs[index] = rawLlr
                 val bit = debugBit(rawLlr)
                 reliabilities[index] = llrReliability(rawLlr)
@@ -462,26 +503,16 @@ class PacketClockDecoder {
         return if (periodNs <= FAST_PERIOD_NS) FAST_SYMBOL_ON_THRESHOLD else SYMBOL_ON_THRESHOLD
     }
 
-    private fun scoreToRawLlr(average: Float, peak: Float, onThreshold: Float): Float {
+    private fun scoreToRawLlr(average: Float, onThreshold: Float): Float {
         val midpoint = (SYMBOL_OFF_THRESHOLD + onThreshold) * 0.5f
         val scale = (onThreshold - SYMBOL_OFF_THRESHOLD).coerceAtLeast(0.05f)
         val averageLlr = (midpoint - average) / scale * SCORE_LLR_SCALE
-        val peakBoost = if (
-            symbolSampleCount >= MIN_PEAK_BOOST_SAMPLES &&
-            symbolWeightSum >= MIN_PEAK_BOOST_WEIGHT &&
-            peak > SYMBOL_STRONG_ON_THRESHOLD &&
-            average > midpoint
-        ) {
-            -((peak - SYMBOL_STRONG_ON_THRESHOLD) / SCORE_PEAK_SCALE).coerceIn(0f, SCORE_PEAK_LLR_BOOST)
-        } else {
-            0f
-        }
         val sampleConfidence = when {
             symbolSampleCount <= 1 -> SINGLE_SAMPLE_LLR_SCALE
             symbolSampleCount == 2 -> DOUBLE_SAMPLE_LLR_SCALE
             else -> 1f
         }
-        return ((averageLlr + peakBoost) * sampleConfidence).coerceIn(-SCORE_LLR_CLAMP, SCORE_LLR_CLAMP)
+        return (averageLlr * sampleConfidence).coerceIn(-SCORE_LLR_CLAMP, SCORE_LLR_CLAMP)
     }
 
     private fun debugBit(rawLlr: Float): Char {
@@ -525,8 +556,9 @@ class PacketClockDecoder {
         preambleIntervalCount = 0
         preambleMisses = 0
         lastPreambleScores = null
-        pendingPreambleEdgeAtNs = 0L
-        pendingPreambleEdgeScore = 0f
+        java.util.Arrays.fill(preambleObservedAtNs, 0L)
+        java.util.Arrays.fill(preambleObservedWeights, 0f)
+        clearPendingPreambleEdges()
         lastPreambleEstimateMode = ""
         lastPreambleFirstIntervalNs = 0L
         lastPreambleSecondIntervalNs = 0L
@@ -573,23 +605,18 @@ class PacketClockDecoder {
         const val PREAMBLE_ZERO_AVG_SCORE = 0.46f
         const val PREAMBLE_ON_MATCH_SCORE = 0.82f
         const val PREAMBLE_OFF_MATCH_SCORE = 0.82f
+        const val MAX_PENDING_PREAMBLE_EDGES = 4
         const val PREAMBLE_EDGE_SCORE_THRESHOLD = 0.28f
         const val PREAMBLE_UNEXPECTED_EDGE_PENALTY = 0.18f
         const val SYMBOL_ON_THRESHOLD = 0.94f
         const val FAST_SYMBOL_ON_THRESHOLD = 1.05f
-        const val SYMBOL_STRONG_ON_THRESHOLD = 1.12f
         const val SYMBOL_OFF_THRESHOLD = 0.56f
         const val SCORE_LLR_SCALE = 3.0f
         const val SCORE_LLR_CLAMP = 3.0f
-        const val SCORE_PEAK_SCALE = 0.30f
-        const val SCORE_PEAK_LLR_BOOST = 0.8f
-        const val MIN_PEAK_BOOST_SAMPLES = 2
-        const val MIN_PEAK_BOOST_WEIGHT = 0.45f
         const val SINGLE_SAMPLE_LLR_SCALE = 0.68f
         const val DOUBLE_SAMPLE_LLR_SCALE = 0.88f
         const val DEBUG_BIT_ERASURE_LLR = 0.30f
         const val FAST_PERIOD_NS = 135_000_000L
-        const val PREAMBLE_ANCHOR_ERROR_PERCENT = 18L
         const val MEDIUM_PERIOD_NS = 180_000_000L
         val ALLOWED_PERIODS_NS = longArrayOf(500_000_000L, 250_000_000L, 125_000_000L)
         const val FAST_SYMBOL_EDGE_LIMIT = 0.38f
