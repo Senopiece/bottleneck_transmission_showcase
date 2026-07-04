@@ -1,0 +1,17 @@
+[project]
+name = "receiver-training"
+version = "0.1.0"
+description = "Training entry points for receiver tracker, LED reader, and future neural BP models"
+requires-python = ">=3.11"
+dependencies = [
+    "receiver-tools",
+    "numpy>=2.0.0",
+    "opencv-python>=4.10.0.84,<5",
+    "tqdm>=4.66.0",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+receiver-tools = { path = "../tools", editable = true }

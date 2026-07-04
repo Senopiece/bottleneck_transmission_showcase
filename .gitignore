@@ -1,1 +1,29 @@
 analysis/data/*
+
+# Receiver datasets and generated artifacts.
+receiver/datasets/raw/videos/**/*.mp4
+receiver/datasets/raw/videos/**/*.mov
+receiver/datasets/raw/videos/**/*.mkv
+receiver/datasets/derived/**
+!receiver/datasets/derived/**/
+!receiver/datasets/derived/**/README.md
+
+# Receiver Python tooling.
+receiver/tools/.venv/
+receiver/tools/__pycache__/
+receiver/tools/**/__pycache__/
+receiver/tools/*.egg-info/
+receiver/tools/.pytest_cache/
+
+# Training outputs.
+receiver/training/.venv/
+receiver/training/__pycache__/
+receiver/training/**/__pycache__/
+receiver/training/.pytest_cache/
+receiver/training/**/runs/**
+!receiver/training/**/runs/README.md
+
+# Models
+receiver/models/**
+!receiver/models/**/
+!receiver/models/**/README.md
