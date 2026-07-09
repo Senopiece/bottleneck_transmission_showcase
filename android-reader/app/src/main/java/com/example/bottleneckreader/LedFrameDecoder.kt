@@ -1,20 +1,24 @@
 package com.example.bottleneckreader
 
+import ai.onnxruntime.OnnxTensor
+import ai.onnxruntime.OrtEnvironment
+import ai.onnxruntime.OrtSession
+import android.content.Context
 import androidx.camera.core.ImageProxy
 import java.nio.ByteBuffer
+import java.nio.FloatBuffer
 import java.util.Locale
 import kotlin.math.PI
-import kotlin.math.abs
 import kotlin.math.atan2
 import kotlin.math.cos
 import kotlin.math.exp
 import kotlin.math.ln
 import kotlin.math.max
 import kotlin.math.min
-import kotlin.math.roundToInt
+import kotlin.math.sqrt
 import kotlin.math.sin
 
-class LedFrameDecoder {
+class LedFrameDecoder(context: Context) {
     private data class RotatedSearchArea(
         val left: Float,
         val top: Float,
@@ -60,6 +64,7 @@ class LedFrameDecoder {
     )
 
     private val constants = GeometryConstants()
+    private val neural = NeuralVisionModels(context.applicationContext, constants)
 
     var lastDebugLines: List<String> = emptyList()
         private set
@@ -127,9 +132,11 @@ class LedFrameDecoder {
         missedFrames = 0
 
         val model = modelForTheta(fit.theta)
-        val scores = readLedScores(reader, model)
+        val patternConfidence = fit.score.coerceIn(0f, 1f)
+        val scores = readLedScores(reader, model, patternConfidence)
+        updateLedDebugLine(scores, patternConfidence)
         val debugLines = finishDebugFrame("HIT", fit)
-        return frameForModel(reader, model, scores, debugLines)
+        return frameForModel(reader, model, scores, patternConfidence, debugLines)
     }
 
     fun resetTracking() {
@@ -250,7 +257,7 @@ class LedFrameDecoder {
                 bestTheta = theta
                 bestBreakdown = breakdown
             }
-            if (!improved && isAccepted(bestBreakdown, bestScore, tracking = trackingAcceptance)) break
+            if (!improved && isAccepted(bestScore, tracking = trackingAcceptance)) break
         }
 
         return Fit(bestTheta, bestBreakdown)
@@ -264,16 +271,12 @@ class LedFrameDecoder {
     }
 
     private fun isAccepted(fit: Fit, tracking: Boolean): Boolean {
-        return isAccepted(fit.breakdown, fit.score, tracking)
+        return isAccepted(fit.score, tracking)
     }
 
-    private fun isAccepted(parts: ScoreBreakdown, score: Float, tracking: Boolean): Boolean {
-        val minScore = if (tracking) MIN_TRACKING_ACCEPT_SCORE else MIN_ACQUIRE_ACCEPT_SCORE
-        val minSquare = if (tracking) MIN_TRACKING_ACCEPT_SQUARE else MIN_ACQUIRE_ACCEPT_SQUARE
-        val minTriangle = if (tracking) MIN_TRACKING_ACCEPT_TRIANGLE else MIN_ACQUIRE_ACCEPT_TRIANGLE
-        if (score < minScore) return false
-        return parts.square >= minSquare &&
-            parts.triangle >= minTriangle
+    private fun isAccepted(score: Float, tracking: Boolean): Boolean {
+        val minScore = acceptScoreThreshold(tracking)
+        return score >= minScore
     }
 
     private fun scoreBreakdown(reader: YuvReader, searchArea: RotatedSearchArea, theta: Theta): ScoreBreakdown {
@@ -282,12 +285,12 @@ class LedFrameDecoder {
             return ScoreBreakdown(BAD_SCORE, 0f, 0f)
         }
 
-        val square = squareTemplateScore(reader, model)
-        val triangle = triangleTemplateScore(reader, model)
+        val likelihood = neural.trackerLikelihood(reader, model)
+        val square = likelihood
+        val triangle = likelihood
         val markerDistanceInGuide = model.distancePx / reader.guideWidth()
 
-        val score = square * 2.95f +
-            triangle * 4.35f
+        val score = likelihood
 
         if (Diagnostics.enabled && score > debugBestScore) {
             debugBestScore = score
@@ -353,40 +356,11 @@ class LedFrameDecoder {
             rotated.y <= searchArea.top + searchArea.height - margin
     }
 
-    private fun squareTemplateScore(reader: YuvReader, model: PatternModel): Float {
-        val size = model.squareSizePx
-        val radius = sampleRadius(size)
-        val insideMean = markerMean(reader, model, model.start, squareInsideSamples, size, radius)
-        val outsideMean = markerMean(reader, model, model.start, squareOutsideSamples, size, radius)
-        val cornerMin = markerMin(reader, model, model.start, squareCornerSamples, size, radius)
-        val edgeContrast = (insideMean - outsideMean).coerceIn(0f, 1f)
-        val fill = min(insideMean, cornerMin + 0.12f)
-        val compact = (markerValue(reader, model.start.x, model.start.y, radius) - cornerMin - 0.18f).coerceIn(0f, 1f)
-        val score = (fill * 0.42f + edgeContrast * 0.42f + cornerMin * 0.28f - compact * 0.55f)
-            .coerceIn(0f, 1f)
-        return score
-    }
-
-    private fun triangleTemplateScore(reader: YuvReader, model: PatternModel): Float {
-        val size = model.triangleSizePx
-        val radius = sampleRadius(size)
-        val insideMean = markerMean(reader, model, model.end, triangleInsideSamples, size, radius)
-        val baseMean = markerMean(reader, model, model.end, triangleBaseSamples, size, radius)
-        val outsideMean = markerMean(reader, model, model.end, triangleOutsideSamples, size, radius)
-        val upperMean = markerMean(reader, model, model.end, triangleUpperEmptySamples, size, radius)
-        val contrast = (insideMean - outsideMean).coerceIn(0f, 1f)
-        val taper = (baseMean - upperMean).coerceIn(0f, 1f)
-        val fill = min(insideMean, baseMean + 0.10f)
-        val compact = (insideMean - baseMean - 0.20f).coerceIn(0f, 1f)
-        val score = (fill * 0.36f + contrast * 0.34f + taper * 0.42f - compact * 0.62f)
-            .coerceIn(0f, 1f)
-        return score
-    }
-
     private fun frameForModel(
         reader: YuvReader,
         model: PatternModel,
         scores: FloatArray,
+        patternConfidence: Float,
         debugLines: List<String>,
     ): DetectionFrame {
         val overlayRadius = (model.ledRadiusPx * 1.25f).coerceIn(3.5f, 13f)
@@ -400,6 +374,7 @@ class LedFrameDecoder {
             cropHeight = reader.cropHeight,
             rotationDegrees = reader.rotationDegrees,
             ledScores = scores,
+            patternConfidence = patternConfidence,
             slots = model.slots.mapIndexed { index, point ->
                 LedSlot(
                     imagePoint = point,
@@ -429,165 +404,21 @@ class LedFrameDecoder {
         )
     }
 
-    private fun readLedScores(reader: YuvReader, model: PatternModel): FloatArray {
-        val scores = FloatArray(model.slots.size)
-        for (index in model.slots.indices) {
-            scores[index] = ledOnScore(reader, model.slots[index], model.ledRadiusPx, model)
-        }
+    private fun readLedScores(reader: YuvReader, model: PatternModel, patternConfidence: Float): FloatArray {
+        return neural.ledScores(reader, model, patternConfidence)
+    }
+
+    private fun acceptScoreThreshold(tracking: Boolean): Float {
+        return if (tracking) MIN_TRACKING_ACCEPT_SCORE else MIN_ACQUIRE_ACCEPT_SCORE
+    }
+
+    private fun updateLedDebugLine(scores: FloatArray, patternConfidence: Float) {
         if (Diagnostics.enabled) {
             debugBitsLine = buildString {
-                append("ledScore")
+                append("ledScore w=").append(fmt(patternConfidence))
                 scores.forEach { append(' ').append(fmt(it)) }
             }
         }
-        return scores
-    }
-
-    private fun ledOnScore(reader: YuvReader, center: ImagePoint, radiusPx: Float, model: PatternModel): Float {
-        val r = radiusPx.roundToInt().coerceIn(2, 9)
-        val tightR = max(1, (r * 0.72f).roundToInt())
-        val side = radiusPx * 2.65f
-        val centerLuma = lumaMean(reader, center, tightR)
-        val centerPeak = lumaMax(reader, center, r)
-        val bgLuma = (
-            lumaMean(reader, center.local(model, 0f, side, 1f), r) +
-                lumaMean(reader, center.local(model, 0f, -side, 1f), r) +
-                lumaMean(reader, center.local(model, side, 0f, 1f), r) +
-                lumaMean(reader, center.local(model, -side, 0f, 1f), r)
-            ) * 0.25f
-        val blue = blueObjectValue(reader, center, r)
-        val lumaContrast = ((centerLuma - bgLuma - 10f) / 78f).coerceIn(-0.35f, 1.35f)
-        val peakContrast = ((centerPeak - bgLuma - 18f) / 95f).coerceIn(-0.35f, 1.35f)
-        val highlight = ((centerPeak - 150f) / 85f).coerceIn(0f, 1.15f)
-        return (lumaContrast * 0.42f + peakContrast * 0.38f + highlight * 0.20f + blue * 0.06f)
-            .coerceIn(-0.5f, 1.6f)
-    }
-
-    private fun markerValue(reader: YuvReader, centerX: Float, centerY: Float, radiusPx: Int): Float {
-        var score = 0f
-        var weightSum = 0f
-        val cx = centerX.roundToInt()
-        val cy = centerY.roundToInt()
-        for (i in SAMPLE_X.indices) {
-            val x = cx + (SAMPLE_X[i] * radiusPx).roundToInt()
-            val y = cy + (SAMPLE_Y[i] * radiusPx).roundToInt()
-            if (x !in 0 until reader.width || y !in 0 until reader.height) continue
-            val yy = reader.y(x, y)
-            val neutral = (1f - (abs(reader.u(x, y) - 128) + abs(reader.v(x, y) - 128)) / 128f)
-                .coerceIn(0f, 1f)
-            val brightness = ((yy - 78f) / 148f).coerceIn(0f, 1f)
-            val bluePenalty = (max(0f, reader.blueDominance(x, y) - 38f) / 95f).coerceIn(0f, 1f)
-            val w = SAMPLE_W[i]
-            score += brightness * (0.50f + neutral * 0.50f) * (1f - bluePenalty * 0.72f) * w
-            weightSum += w
-        }
-        return if (weightSum == 0f) 0f else score / weightSum
-    }
-
-    private fun blueObjectValue(reader: YuvReader, center: ImagePoint, radiusPx: Int): Float {
-        var score = 0f
-        var weightSum = 0f
-        val cx = center.x.roundToInt()
-        val cy = center.y.roundToInt()
-        for (i in SAMPLE_X.indices) {
-            val x = cx + (SAMPLE_X[i] * radiusPx).roundToInt()
-            val y = cy + (SAMPLE_Y[i] * radiusPx).roundToInt()
-            if (x !in 0 until reader.width || y !in 0 until reader.height) continue
-            val blue = ((reader.blueDominance(x, y) - 12f) / 92f).coerceIn(0f, 1f)
-            val visible = ((abs(reader.y(x, y) - 72f) + 24f) / 160f).coerceIn(0.15f, 1f)
-            val w = SAMPLE_W[i]
-            score += blue * visible * w
-            weightSum += w
-        }
-        return if (weightSum == 0f) 0f else score / weightSum
-    }
-
-    private fun lumaMean(reader: YuvReader, center: ImagePoint, radiusPx: Int): Float {
-        var sum = 0f
-        var weightSum = 0f
-        val cx = center.x.roundToInt()
-        val cy = center.y.roundToInt()
-        for (i in SAMPLE_X.indices) {
-            val x = cx + (SAMPLE_X[i] * radiusPx).roundToInt()
-            val y = cy + (SAMPLE_Y[i] * radiusPx).roundToInt()
-            if (x !in 0 until reader.width || y !in 0 until reader.height) continue
-            val w = SAMPLE_W[i]
-            sum += reader.y(x, y) * w
-            weightSum += w
-        }
-        return if (weightSum == 0f) 0f else sum / weightSum
-    }
-
-    private fun lumaMax(reader: YuvReader, center: ImagePoint, radiusPx: Int): Float {
-        var best = 0
-        val cx = center.x.roundToInt()
-        val cy = center.y.roundToInt()
-        for (i in SAMPLE_X.indices) {
-            val x = cx + (SAMPLE_X[i] * radiusPx).roundToInt()
-            val y = cy + (SAMPLE_Y[i] * radiusPx).roundToInt()
-            if (x !in 0 until reader.width || y !in 0 until reader.height) continue
-            best = max(best, reader.y(x, y))
-        }
-        return best.toFloat()
-    }
-
-    private fun ImagePoint.local(model: PatternModel, along: Float, normal: Float, scale: Float): ImagePoint {
-        return ImagePoint(
-            x = x + model.ux * along * scale + model.vx * normal * scale,
-            y = y + model.uy * along * scale + model.vy * normal * scale,
-        )
-    }
-
-    private fun sampleRadius(sizePx: Float): Int {
-        return (sizePx * 0.085f).roundToInt().coerceIn(1, 4)
-    }
-
-    private fun markerMean(
-        reader: YuvReader,
-        model: PatternModel,
-        origin: ImagePoint,
-        samples: Array<LocalPoint>,
-        size: Float,
-        radius: Int,
-    ): Float {
-        if (samples.isEmpty()) return 0f
-        var sum = 0f
-        for (sample in samples) {
-            sum += markerValueAtLocal(reader, model, origin, sample, size, radius)
-        }
-        return sum / samples.size
-    }
-
-    private fun markerMin(
-        reader: YuvReader,
-        model: PatternModel,
-        origin: ImagePoint,
-        samples: Array<LocalPoint>,
-        size: Float,
-        radius: Int,
-    ): Float {
-        if (samples.isEmpty()) return 0f
-        var best = Float.POSITIVE_INFINITY
-        for (sample in samples) {
-            best = min(best, markerValueAtLocal(reader, model, origin, sample, size, radius))
-        }
-        return best
-    }
-
-    private fun markerValueAtLocal(
-        reader: YuvReader,
-        model: PatternModel,
-        origin: ImagePoint,
-        sample: LocalPoint,
-        size: Float,
-        radius: Int,
-    ): Float {
-        return markerValue(
-            reader = reader,
-            centerX = origin.x + model.ux * sample.x * size + model.vx * sample.y * size,
-            centerY = origin.y + model.uy * sample.x * size + model.vy * sample.y * size,
-            radiusPx = radius,
-        )
     }
 
     private fun normalizeAngle(angle: Float): Float {
@@ -597,8 +428,6 @@ class LedFrameDecoder {
         while (a > PI.toFloat()) a -= twoPi
         return a
     }
-
-    private data class LocalPoint(val x: Float, val y: Float)
 
     private data class Step(val translationPx: Float, val angleRad: Float, val logDistance: Float)
 
@@ -682,9 +511,51 @@ class LedFrameDecoder {
             return vBuffer.get((y / 2) * vRowStride + (x / 2) * vPixelStride).toInt() and 0xff
         }
 
-        fun blueDominance(x: Int, y: Int): Float {
-            val yy = this.y(x, y)
-            return (u(x, y) - v(x, y)) + (yy - 45) * 0.12f
+        fun yBilinear(x: Float, y: Float): Float {
+            return bilinear(
+                x = x,
+                y = y,
+                maxX = width - 1,
+                maxY = height - 1,
+            ) { xi, yi -> this.y(xi, yi).toFloat() }
+        }
+
+        fun uBilinear(x: Float, y: Float): Float {
+            return bilinear(
+                x = x,
+                y = y,
+                maxX = width - 1,
+                maxY = height - 1,
+            ) { xi, yi -> this.u(xi, yi).toFloat() }
+        }
+
+        fun vBilinear(x: Float, y: Float): Float {
+            return bilinear(
+                x = x,
+                y = y,
+                maxX = width - 1,
+                maxY = height - 1,
+            ) { xi, yi -> this.v(xi, yi).toFloat() }
+        }
+
+        private fun bilinear(
+            x: Float,
+            y: Float,
+            maxX: Int,
+            maxY: Int,
+            sample: (Int, Int) -> Float,
+        ): Float {
+            val clampedX = x.coerceIn(0f, maxX.toFloat())
+            val clampedY = y.coerceIn(0f, maxY.toFloat())
+            val x0 = clampedX.toInt().coerceIn(0, maxX)
+            val y0 = clampedY.toInt().coerceIn(0, maxY)
+            val x1 = (x0 + 1).coerceAtMost(maxX)
+            val y1 = (y0 + 1).coerceAtMost(maxY)
+            val fx = clampedX - x0
+            val fy = clampedY - y0
+            val top = sample(x0, y0) * (1f - fx) + sample(x1, y0) * fx
+            val bottom = sample(x0, y1) * (1f - fx) + sample(x1, y1) * fx
+            return top * (1f - fy) + bottom * fy
         }
     }
 
@@ -710,18 +581,207 @@ class LedFrameDecoder {
         fun triangleSizeToMarkerSizeRatio(): Float = triangleMm / markerMm
     }
 
+    private class NeuralVisionModels(
+        context: Context,
+        private val constants: GeometryConstants,
+    ) {
+        private val env: OrtEnvironment = OrtEnvironment.getEnvironment()
+        private val sessionOptions = OrtSession.SessionOptions().apply {
+            setOptimizationLevel(OrtSession.SessionOptions.OptLevel.BASIC_OPT)
+            setIntraOpNumThreads(1)
+        }
+        private val trackerSession: OrtSession = env.createSession(
+            context.assets.open(TRACKER_MODEL_ASSET).use { it.readBytes() },
+            sessionOptions,
+        )
+        private val ledSession: OrtSession = env.createSession(
+            context.assets.open(LED_MODEL_ASSET).use { it.readBytes() },
+            sessionOptions,
+        )
+
+        fun trackerLikelihood(reader: YuvReader, model: PatternModel): Float {
+            val input = markerTensor(reader, model)
+            OnnxTensor.createTensor(env, FloatBuffer.wrap(input), longArrayOf(1, 2, TRACKER_PATCH_H.toLong(), TRACKER_PATCH_W.toLong())).use { tensor ->
+                trackerSession.run(mapOf("patch" to tensor)).use { result ->
+                    val logit = firstFloat(result[0].value)
+                    return sigmoid(logit)
+                }
+            }
+        }
+
+        fun ledScores(reader: YuvReader, model: PatternModel, detectorLikelihood: Float): FloatArray {
+            val input = ledTensor(reader, model)
+            val likelihood = FloatArray(LED_COUNT) { detectorLikelihood.coerceIn(0f, 1f) }
+            OnnxTensor.createTensor(env, FloatBuffer.wrap(input), longArrayOf(LED_COUNT.toLong(), 3, LED_PATCH.toLong(), LED_PATCH.toLong())).use { cropTensor ->
+                OnnxTensor.createTensor(env, FloatBuffer.wrap(likelihood), longArrayOf(LED_COUNT.toLong())).use { likelihoodTensor ->
+                    ledSession.run(
+                        mapOf(
+                            "led_crop" to cropTensor,
+                            "detector_likelihood" to likelihoodTensor,
+                        ),
+                    ).use { result ->
+                        val logits = floats(result[0].value, LED_COUNT)
+                        return FloatArray(LED_COUNT) { index ->
+                            // PacketClockDecoder consumes the old score scale:
+                            // OFF around 0.56, ON above 1.0. Keep the protocol layer unchanged.
+                            0.54f + sigmoid(logits[index]) * 0.64f
+                        }
+                    }
+                }
+            }
+        }
+
+        private fun markerTensor(reader: YuvReader, model: PatternModel): FloatArray {
+            val count = TRACKER_PATCH_W * TRACKER_PATCH_H
+            val luma = FloatArray(count)
+            for (y in 0 until TRACKER_PATCH_H) {
+                val localY = ((y.toFloat() / (TRACKER_PATCH_H - 1)) - 0.5f) * MARKER_PATCH_LOCAL_H
+                for (x in 0 until TRACKER_PATCH_W) {
+                    val localX = ((x.toFloat() / (TRACKER_PATCH_W - 1)) - 0.5f) * MARKER_PATCH_LOCAL_W
+                    luma[y * TRACKER_PATCH_W + x] = sampleLuma(reader, model, localX, localY) / 255f
+                }
+            }
+            val normalized = normalizedLuma(luma)
+            val edge = edgeChannel(luma, TRACKER_PATCH_W, TRACKER_PATCH_H)
+            val out = FloatArray(2 * count)
+            System.arraycopy(normalized, 0, out, 0, count)
+            System.arraycopy(edge, 0, out, count, count)
+            return out
+        }
+
+        private fun ledTensor(reader: YuvReader, model: PatternModel): FloatArray {
+            val perCrop = LED_PATCH * LED_PATCH
+            val out = FloatArray(LED_COUNT * 3 * perCrop)
+            val sideX = LED_CROP_SOURCE_SIDE / LED_MARKER_PATCH_W * MARKER_PATCH_LOCAL_W
+            val sideY = LED_CROP_SOURCE_SIDE / LED_MARKER_PATCH_H * MARKER_PATCH_LOCAL_H
+            for (led in 0 until LED_COUNT) {
+                val luma = FloatArray(perCrop)
+                val blue = FloatArray(perCrop)
+                val centerX = constants.slotFractions[led] - 0.5f
+                for (y in 0 until LED_PATCH) {
+                    val dy = ((y.toFloat() / (LED_PATCH - 1)) - 0.5f) * sideY
+                    for (x in 0 until LED_PATCH) {
+                        val dx = ((x.toFloat() / (LED_PATCH - 1)) - 0.5f) * sideX
+                        val index = y * LED_PATCH + x
+                        val pixel = sampleRgb(reader, model, centerX + dx, dy)
+                        luma[index] = pixel.luma / 255f
+                        blue[index] = (pixel.b - 0.5f * pixel.g - 0.5f * pixel.r).coerceIn(-1f, 1f)
+                    }
+                }
+                val normalized = normalizedLuma(luma)
+                val edge = edgeChannel(luma, LED_PATCH, LED_PATCH)
+                val base = led * 3 * perCrop
+                System.arraycopy(normalized, 0, out, base, perCrop)
+                System.arraycopy(blue, 0, out, base + perCrop, perCrop)
+                System.arraycopy(edge, 0, out, base + 2 * perCrop, perCrop)
+            }
+            return out
+        }
+
+        private fun normalizedLuma(luma: FloatArray): FloatArray {
+            var sum = 0f
+            for (value in luma) sum += value
+            val mean = sum / luma.size
+            var variance = 0f
+            for (value in luma) {
+                val d = value - mean
+                variance += d * d
+            }
+            val std = sqrt(variance / luma.size).coerceAtLeast(1e-4f)
+            return FloatArray(luma.size) { index -> ((luma[index] - mean) / std).coerceIn(-3f, 3f) / 3f }
+        }
+
+        private fun edgeChannel(luma: FloatArray, width: Int, height: Int): FloatArray {
+            val edge = FloatArray(luma.size)
+            for (y in 0 until height) {
+                val ym = (y - 1).coerceAtLeast(0)
+                val yp = (y + 1).coerceAtMost(height - 1)
+                for (x in 0 until width) {
+                    val xm = (x - 1).coerceAtLeast(0)
+                    val xp = (x + 1).coerceAtMost(width - 1)
+                    val gx = luma[y * width + xp] - luma[y * width + xm]
+                    val gy = luma[yp * width + x] - luma[ym * width + x]
+                    edge[y * width + x] = sqrt(gx * gx + gy * gy)
+                }
+            }
+            val sorted = edge.copyOf()
+            sorted.sort()
+            val p95 = sorted[(sorted.size * 95 / 100).coerceIn(0, sorted.lastIndex)].coerceAtLeast(1e-4f)
+            for (index in edge.indices) edge[index] = (edge[index] / p95).coerceIn(0f, 1f)
+            return edge
+        }
+
+        private fun sampleLuma(reader: YuvReader, model: PatternModel, localX: Float, localY: Float): Float {
+            val x = model.cx(localX, localY)
+            val y = model.cy(localX, localY)
+            return reader.yBilinear(x, y)
+        }
+
+        private fun sampleRgb(reader: YuvReader, model: PatternModel, localX: Float, localY: Float): RgbPixel {
+            val x = model.cx(localX, localY)
+            val y = model.cy(localX, localY)
+            val yy = reader.yBilinear(x, y)
+            val uu = reader.uBilinear(x, y) - 128f
+            val vv = reader.vBilinear(x, y) - 128f
+            val r = ((yy + 1.402f * vv) / 255f).coerceIn(0f, 1f)
+            val g = ((yy - 0.344136f * uu - 0.714136f * vv) / 255f).coerceIn(0f, 1f)
+            val b = ((yy + 1.772f * uu) / 255f).coerceIn(0f, 1f)
+            return RgbPixel(r = r, g = g, b = b, luma = yy)
+        }
+
+        private fun PatternModel.cx(localX: Float, localY: Float): Float {
+            return start.x + ux * distancePx * (localX + 0.5f) + vx * distancePx * localY
+        }
+
+        private fun PatternModel.cy(localX: Float, localY: Float): Float {
+            return start.y + uy * distancePx * (localX + 0.5f) + vy * distancePx * localY
+        }
+
+        private fun sigmoid(value: Float): Float {
+            val clamped = value.coerceIn(-40f, 40f)
+            return (1f / (1f + exp(-clamped)))
+        }
+
+        private fun firstFloat(value: Any): Float {
+            return floats(value, 1)[0]
+        }
+
+        private fun floats(value: Any, expected: Int): FloatArray {
+            return when (value) {
+                is FloatArray -> value.copyOf(expected)
+                is Array<*> -> {
+                    if (value.isNotEmpty() && value[0] is FloatArray) {
+                        (value[0] as FloatArray).copyOf(expected)
+                    } else {
+                        FloatArray(expected) { index -> (value[index] as Number).toFloat() }
+                    }
+                }
+                else -> FloatArray(expected) { 0f }
+            }
+        }
+
+        private data class RgbPixel(val r: Float, val g: Float, val b: Float, val luma: Float)
+    }
+
     private companion object {
         const val RESET_AFTER_MISSES = 4
         const val TRACKING_CONTINUITY_MISSES = 1
-        const val MIN_TRACKING_ACCEPT_SCORE = 4.0f
-        const val MIN_ACQUIRE_ACCEPT_SCORE = 4.75f
+        const val MIN_TRACKING_ACCEPT_SCORE = 0.56f
+        const val MIN_ACQUIRE_ACCEPT_SCORE = 0.72f
         const val INITIAL_PATTERN_DISTANCE_FRACTION = 0.82f
         const val MIN_PATTERN_DISTANCE_PX = 32f
-        const val MIN_TRACKING_ACCEPT_SQUARE = 0.62f
-        const val MIN_TRACKING_ACCEPT_TRIANGLE = 0.38f
-        const val MIN_ACQUIRE_ACCEPT_SQUARE = 0.72f
-        const val MIN_ACQUIRE_ACCEPT_TRIANGLE = 0.52f
         const val BAD_SCORE = -1_000_000f
+        const val TRACKER_MODEL_ASSET = "tracker_likelihood.onnx"
+        const val LED_MODEL_ASSET = "led_reader.onnx"
+        const val TRACKER_PATCH_W = 96
+        const val TRACKER_PATCH_H = 36
+        const val LED_PATCH = 28
+        const val LED_COUNT = 5
+        const val MARKER_PATCH_LOCAL_W = 1.35f
+        const val MARKER_PATCH_LOCAL_H = 0.46f
+        const val LED_MARKER_PATCH_W = 160f
+        const val LED_MARKER_PATCH_H = 64f
+        const val LED_CROP_SOURCE_SIDE = 29f
 
         val ACQUIRE_STEPS = arrayOf(
             Step(14f, (5.2f * PI / 180.0).toFloat(), 0.060f),
@@ -737,64 +797,5 @@ class LedFrameDecoder {
             Step(1.6f, (0.55f * PI / 180.0).toFloat(), 0.007f),
             Step(0.8f, (0.28f * PI / 180.0).toFloat(), 0.0035f),
         )
-
-        val squareInsideSamples = arrayOf(
-            LocalPoint(0f, 0f),
-            LocalPoint(-0.24f, -0.24f),
-            LocalPoint(0.24f, -0.24f),
-            LocalPoint(-0.24f, 0.24f),
-            LocalPoint(0.24f, 0.24f),
-            LocalPoint(-0.34f, 0f),
-            LocalPoint(0.34f, 0f),
-            LocalPoint(0f, -0.34f),
-            LocalPoint(0f, 0.34f),
-        )
-        val squareCornerSamples = arrayOf(
-            LocalPoint(-0.34f, -0.34f),
-            LocalPoint(0.34f, -0.34f),
-            LocalPoint(-0.34f, 0.34f),
-            LocalPoint(0.34f, 0.34f),
-        )
-        val squareOutsideSamples = arrayOf(
-            LocalPoint(-0.64f, 0f),
-            LocalPoint(0.64f, 0f),
-            LocalPoint(0f, -0.64f),
-            LocalPoint(0f, 0.64f),
-            LocalPoint(-0.58f, -0.58f),
-            LocalPoint(0.58f, -0.58f),
-            LocalPoint(-0.58f, 0.58f),
-            LocalPoint(0.58f, 0.58f),
-        )
-        val triangleInsideSamples = arrayOf(
-            LocalPoint(0f, -0.32f),
-            LocalPoint(0f, -0.06f),
-            LocalPoint(0f, 0.14f),
-            LocalPoint(-0.16f, 0.22f),
-            LocalPoint(0.16f, 0.22f),
-            LocalPoint(-0.26f, 0.34f),
-            LocalPoint(0.26f, 0.34f),
-        )
-        val triangleBaseSamples = arrayOf(
-            LocalPoint(-0.32f, 0.34f),
-            LocalPoint(0f, 0.34f),
-            LocalPoint(0.32f, 0.34f),
-        )
-        val triangleUpperEmptySamples = arrayOf(
-            LocalPoint(-0.34f, -0.18f),
-            LocalPoint(0.34f, -0.18f),
-            LocalPoint(-0.44f, 0.02f),
-            LocalPoint(0.44f, 0.02f),
-        )
-        val triangleOutsideSamples = arrayOf(
-            LocalPoint(-0.58f, 0.06f),
-            LocalPoint(0.58f, 0.06f),
-            LocalPoint(-0.34f, -0.42f),
-            LocalPoint(0.34f, -0.42f),
-            LocalPoint(0f, -0.66f),
-            LocalPoint(0f, 0.66f),
-        )
-        val SAMPLE_X = floatArrayOf(0f, 1f, -1f, 0f, 0f, 0.70f, -0.70f, 0.70f, -0.70f, 0.45f, -0.45f, 0f, 0f)
-        val SAMPLE_Y = floatArrayOf(0f, 0f, 0f, 1f, -1f, 0.70f, 0.70f, -0.70f, -0.70f, 0f, 0f, 0.45f, -0.45f)
-        val SAMPLE_W = floatArrayOf(0.24f, 0.09f, 0.09f, 0.09f, 0.09f, 0.06f, 0.06f, 0.06f, 0.06f, 0.04f, 0.04f, 0.04f, 0.04f)
     }
 }

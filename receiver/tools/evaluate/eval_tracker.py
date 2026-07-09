@@ -9,7 +9,7 @@ from receiver_tools.dataset import default_derived_dir
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Summarize tracker dataset metrics.")
-    parser.add_argument("--summary", type=Path, default=default_derived_dir() / "metrics" / "tracker_stub" / "summary.csv")
+    parser.add_argument("--summary", type=Path, default=default_derived_dir() / "metrics" / "tracker_v003" / "summary.csv")
     return parser.parse_args()
 
 

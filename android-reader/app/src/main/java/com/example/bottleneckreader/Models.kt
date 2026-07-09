@@ -35,6 +35,7 @@ data class DetectionFrame(
     val cropHeight: Int,
     val rotationDegrees: Int,
     val ledScores: FloatArray = FloatArray(0),
+    val patternConfidence: Float = 1f,
     val slots: List<LedSlot>,
     val markers: List<MarkerSlot> = emptyList(),
     val isAcquireMode: Boolean = false,

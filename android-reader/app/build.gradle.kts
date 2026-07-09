@@ -53,6 +53,7 @@ dependencies {
     implementation("androidx.camera:camera-camera2:1.4.1")
     implementation("androidx.camera:camera-lifecycle:1.4.1")
     implementation("androidx.camera:camera-view:1.4.1")
+    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.25.1")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
 }

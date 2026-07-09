@@ -25,7 +25,7 @@ class CameraReader(
     private val eventSink: (ReaderEvent) -> Unit,
 ) {
     private val analyzerExecutor: ExecutorService = Executors.newSingleThreadExecutor()
-    private val decoder = LedFrameDecoder()
+    private val decoder = LedFrameDecoder(context)
     private val closed = AtomicBoolean(false)
     private var provider: ProcessCameraProvider? = null
     private var analyzer: FrameAnalyzer? = null

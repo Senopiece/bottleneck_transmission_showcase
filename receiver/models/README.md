@@ -1,9 +1,11 @@
 # Models
 
-Exported frozen models.
+Current checkpoints and exported ONNX models.
 
-Use versioned filenames and metadata, for example:
+Active Android assets are copied from:
 
-- `tracker_likelihood/tracker_likelihood_v001.onnx`
-- `led_reader/led_reader_v001.onnx`
-- `neural_bp/neural_bp_v001.onnx`
+- `tracker_likelihood/tracker_likelihood_fast_v003.onnx`
+- `led_reader/led_reader_crop_v003_gate.onnx`
+
+Keep only models that are still runnable by the current tools. Old bootstrap and
+intermediate experiments should live outside the repo or be regenerated from logs.

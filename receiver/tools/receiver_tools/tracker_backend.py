@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Protocol
 
 import numpy as np
@@ -32,7 +31,7 @@ class TrackerBackend(Protocol):
 
 
 class StubTrackerBackend:
-    """Placeholder backend until the C++ acquirer/tracker is implemented."""
+    """No-op backend for checking dataset runner plumbing."""
 
     def reset(self) -> None:
         return None
@@ -45,15 +44,4 @@ class StubTrackerBackend:
             x=width * 0.5,
             y=height * 0.5,
             debug="stub_backend",
-        )
-
-
-class NativeTrackerBackend:
-    """Reserved wrapper for the future C++ tracker shared library."""
-
-    def __init__(self, library_path: Path):
-        self.library_path = library_path
-        raise NotImplementedError(
-            "Native C++ tracker wrapper is not implemented yet. "
-            f"Requested library: {library_path}"
         )
