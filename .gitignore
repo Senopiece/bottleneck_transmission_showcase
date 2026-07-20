@@ -1,3 +1,47 @@
+# Node.js dependencies and local tool output.
+**/node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Python environments and caches.
+**/.venv/
+**/__pycache__/
+*.py[cod]
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+.coverage
+coverage.xml
+
+# Local configuration and secrets.
+.env
+.env.*
+!.env.example
+local.properties
+
+# IDE and operating-system files.
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Generic build and temporary output.
+**/.gradle/
+**/build/
+*.log
+*.tmp
+*.temp
+
+# Generated poster intermediates. Final PDF/PPTX remain publishable.
+poster/assets/*.png
+poster/optical_receiver_poster.html
+poster/optical_receiver_poster.svg
+poster/poster_qa.png
+
 analysis/data/*
 
 # Receiver datasets and generated artifacts.

@@ -1,0 +1,11 @@
+{
+  "name": "optical-receiver-poster",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "python render_perspective_assets.py && node poster.js"
+  },
+  "dependencies": {
+    "pptxgenjs": "4.0.1"
+  }
+}
