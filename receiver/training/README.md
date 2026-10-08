@@ -19,8 +19,10 @@ Current active modules:
 Train/export tracker:
 
 ```powershell
-uv run python -m tracker_likelihood.train --out ..\models\tracker_likelihood\tracker_likelihood_fast_v003.pt
-uv run python -m tracker_likelihood.export_onnx --checkpoint ..\models\tracker_likelihood\tracker_likelihood_fast_v003.pt --out ..\models\tracker_likelihood\tracker_likelihood_fast_v003.onnx
+uv run python -m tracker_likelihood.train --patch-width 64 --patch-height 24 --out ..\models\tracker_likelihood\tracker_likelihood_acquire_v005.pt
+uv run python -m tracker_likelihood.train --patch-width 96 --patch-height 36 --out ..\models\tracker_likelihood\tracker_likelihood_precise_v005.pt
+uv run python -m tracker_likelihood.export_onnx --checkpoint ..\models\tracker_likelihood\tracker_likelihood_acquire_v005.pt --out ..\models\tracker_likelihood\tracker_likelihood_acquire_v005.onnx
+uv run python -m tracker_likelihood.export_onnx --checkpoint ..\models\tracker_likelihood\tracker_likelihood_precise_v005.pt --out ..\models\tracker_likelihood\tracker_likelihood_precise_v005.onnx
 ```
 
 Train/export LED reader:

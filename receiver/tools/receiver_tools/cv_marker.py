@@ -6,6 +6,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import onnx
 
 from receiver_tools.geometry import (
     LED_FRACTIONS,
@@ -20,8 +21,6 @@ from receiver_tools.geometry import (
 from receiver_tools.tracker_backend import TrackerResult
 
 
-ONNX_PATCH_WIDTH = 96
-ONNX_PATCH_HEIGHT = 36
 REFINE_PATCH_SIZE = (128, 48)
 
 
@@ -214,25 +213,57 @@ class CvMarkerDetector:
 class OnnxPatchScorer:
     def __init__(self, model_path: Path):
         self.net = cv2.dnn.readNetFromONNX(str(model_path))
+        model = onnx.load(str(model_path), load_external_data=False)
+        patch_input = next(value for value in model.graph.input if value.name == "patch")
+        shape = patch_input.type.tensor_type.shape.dim
+        self.patch_height = int(shape[2].dim_value)
+        self.patch_width = int(shape[3].dim_value)
+        if self.patch_width <= 0 or self.patch_height <= 0:
+            raise ValueError(f"Tracker ONNX must have static spatial dimensions: {model_path}")
 
-    def score(self, patch_bgr: np.ndarray) -> float:
-        patch = cv2.resize(patch_bgr, (ONNX_PATCH_WIDTH, ONNX_PATCH_HEIGHT), interpolation=cv2.INTER_AREA)
-        gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
-        luma = np.clip((gray - float(gray.mean())) / (float(gray.std()) + 1e-4), -3.0, 3.0) / 3.0
-        gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
-        gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
-        edge = np.sqrt(gx * gx + gy * gy)
-        edge = edge / (float(np.percentile(edge, 95)) + 1e-4)
-        edge = np.clip(edge, 0.0, 1.0)
-        blob = np.stack([luma, edge], axis=0).astype(np.float32)[None, ...]
+    def score(self, patch_bgr: np.ndarray, *, sharp: bool = False) -> float:
+        return float(self.scores([patch_bgr], sharp=sharp)[0])
+
+    def scores(self, patches_bgr: list[np.ndarray], *, sharp: bool = False) -> np.ndarray:
+        if not patches_bgr:
+            return np.empty(0, dtype=np.float32)
+        blob = np.concatenate(
+            [tracker_patch_blob(patch, self.patch_width, self.patch_height) for patch in patches_bgr],
+            axis=0,
+        )
         self.net.setInput(blob)
-        logit = float(np.reshape(self.net.forward(), -1)[0])
-        return float(1.0 / (1.0 + math.exp(-max(-40.0, min(40.0, logit)))))
+        logits = np.asarray(self.net.forward(), dtype=np.float32).reshape(len(patches_bgr), -1)
+        head = 1 if sharp and logits.shape[1] > 1 else 0
+        selected = np.clip(logits[:, head], -40.0, 40.0)
+        return 1.0 / (1.0 + np.exp(-selected))
+
+
+def tracker_patch_blob(patch_bgr: np.ndarray, width: int, height: int) -> np.ndarray:
+    """Build the same normalized luma/edge tensor used by Android."""
+    patch = cv2.resize(patch_bgr, (width, height), interpolation=cv2.INTER_AREA)
+    gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+    std = max(float(gray.std()), 1e-4)
+    luma = np.clip((gray - float(gray.mean())) / std, -3.0, 3.0) / 3.0
+
+    gx = np.empty_like(gray)
+    gy = np.empty_like(gray)
+    gx[:, 1:-1] = gray[:, 2:] - gray[:, :-2]
+    gx[:, 0] = gray[:, 1] - gray[:, 0]
+    gx[:, -1] = gray[:, -1] - gray[:, -2]
+    gy[1:-1, :] = gray[2:, :] - gray[:-2, :]
+    gy[0, :] = gray[1, :] - gray[0, :]
+    gy[-1, :] = gray[-1, :] - gray[-2, :]
+    edge = np.sqrt(gx * gx + gy * gy)
+    flat = edge.reshape(-1)
+    kth = min(flat.size - 1, flat.size * 95 // 100)
+    p95 = max(float(np.partition(flat, kth)[kth]), 1e-4)
+    edge = np.clip(edge / p95, 0.0, 1.0)
+    return np.stack([luma, edge], axis=0).astype(np.float32)[None, ...]
 
 
 def nn_tracking_pose_score(frame_bgr: np.ndarray, pose: Pose, origin: Pose, scorer: OnnxPatchScorer) -> tuple[float, float, float, float, float, float]:
-    patch = warp_marker_patch(frame_bgr, pose, size=(ONNX_PATCH_WIDTH, ONNX_PATCH_HEIGHT))
-    nn_score = scorer.score(patch)
+    patch = warp_marker_patch(frame_bgr, pose, size=(scorer.patch_width, scorer.patch_height))
+    nn_score = scorer.score(patch, sharp=True)
     layout_score = led_layout_score(patch)
     strip_score = strip_background_score(patch)
     border_score = strip_border_score(patch)

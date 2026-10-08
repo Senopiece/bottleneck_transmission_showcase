@@ -140,6 +140,10 @@ class CameraReader(
         private val eventSink: (ReaderEvent) -> Unit,
     ) : ImageAnalysis.Analyzer {
         private var stopped = false
+        private var timingFrameCount = 0
+        private var timingSumMs = 0f
+        private var timingMinMs = Float.POSITIVE_INFINITY
+        private var timingMaxMs = 0f
 
         fun stop() {
             stopped = true
@@ -183,7 +187,36 @@ class CameraReader(
             val elapsedMs = elapsedNs / 1_000_000f
             if (Diagnostics.enabled) {
                 eventSink(ReaderEvent.DecoderTiming(elapsedMs))
+                logTimingWindow(elapsedMs)
             }
+        }
+
+        private fun logTimingWindow(elapsedMs: Float) {
+            timingFrameCount++
+            timingSumMs += elapsedMs
+            timingMinMs = minOf(timingMinMs, elapsedMs)
+            timingMaxMs = maxOf(timingMaxMs, elapsedMs)
+            if (timingFrameCount < TIMING_LOG_WINDOW_FRAMES) return
+
+            val vision = decoder.lastDebugLines.lastOrNull { it.startsWith("vision ") } ?: "vision unavailable"
+            Diagnostics.logVisionTiming(
+                "total avg=%.1f min=%.1f max=%.1f frames=%d | %s".format(
+                    java.util.Locale.US,
+                    timingSumMs / timingFrameCount,
+                    timingMinMs,
+                    timingMaxMs,
+                    timingFrameCount,
+                    vision,
+                ),
+            )
+            timingFrameCount = 0
+            timingSumMs = 0f
+            timingMinMs = Float.POSITIVE_INFINITY
+            timingMaxMs = 0f
+        }
+
+        private companion object {
+            const val TIMING_LOG_WINDOW_FRAMES = 30
         }
     }
 }

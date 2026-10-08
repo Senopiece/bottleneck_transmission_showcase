@@ -6,6 +6,7 @@ from pathlib import Path
 from receiver_tools.dataset import default_dataset_dir, default_derived_dir, discover_videos
 from receiver_tools.runner import run_video, write_summary
 from receiver_tools.cv_marker import CvTrackerBackend
+from receiver_tools.neural_pose_tracker import NeuralPoseTrackerBackend
 from receiver_tools.tracker_backend import StubTrackerBackend
 
 
@@ -13,10 +14,14 @@ def parse_args() -> argparse.Namespace:
     derived = default_derived_dir()
     parser = argparse.ArgumentParser(description="Run tracker/acquirer over receiver dataset videos.")
     parser.add_argument("--dataset", type=Path, default=default_dataset_dir())
-    parser.add_argument("--overlay-out", type=Path, default=derived / "overlays" / "tracker_v003")
-    parser.add_argument("--metrics-out", type=Path, default=derived / "metrics" / "tracker_v003")
-    parser.add_argument("--backend", choices=("stub", "cv"), default="cv")
+    parser.add_argument("--overlay-out", type=Path, default=derived / "overlays" / "tracker_v004")
+    parser.add_argument("--metrics-out", type=Path, default=derived / "metrics" / "tracker_v004")
+    parser.add_argument("--backend", choices=("stub", "cv", "neural"), default="cv")
     parser.add_argument("--tracker-model", type=Path, default=None)
+    parser.add_argument("--acquire-model", type=Path, default=None)
+    parser.add_argument("--precise-model", type=Path, default=None)
+    parser.add_argument("--track-score", type=float, default=0.56)
+    parser.add_argument("--coarse-score", type=float, default=0.42)
     parser.add_argument("--accept-score", type=float, default=0.48)
     parser.add_argument(
         "--include",
@@ -34,6 +39,16 @@ def main() -> None:
     args = parse_args()
     if args.backend == "cv":
         backend = CvTrackerBackend(tracker_model=args.tracker_model, accept_score=args.accept_score)
+    elif args.backend == "neural":
+        if args.acquire_model is None or args.precise_model is None:
+            raise SystemExit("--backend neural requires --acquire-model and --precise-model")
+        backend = NeuralPoseTrackerBackend(
+            args.acquire_model,
+            args.precise_model,
+            coarse_threshold=args.coarse_score,
+            acquire_threshold=args.accept_score,
+            track_threshold=args.track_score,
+        )
     else:
         backend = StubTrackerBackend()
 

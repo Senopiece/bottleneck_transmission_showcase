@@ -47,7 +47,7 @@ Render predictions:
 
 ```powershell
 cd receiver/tools
-uv run python -m evaluate.eval_led_reader --tracker-model ..\models\tracker_likelihood\tracker_likelihood_fast_v003.onnx --model ..\models\led_reader\led_reader_crop_v003_gate.onnx --out ..\datasets\derived\overlays\led_reader_v003_gate --include good5 --max-frames 180 --stride 3
+uv run python -m evaluate.eval_led_reader --tracker-model ..\models\tracker_likelihood\tracker_likelihood_fast_v004.onnx --model ..\models\led_reader\led_reader_crop_v003_gate.onnx --out ..\datasets\derived\overlays\led_reader_v003_gate --include good5 --max-frames 180 --stride 3
 ```
 
 ## Android Port Contract

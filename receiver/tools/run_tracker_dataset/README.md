@@ -6,14 +6,14 @@ Runs the acquire/track loop over all raw videos, then writes:
 - overlay videos;
 - a summary CSV.
 
-The active backend is `cv`: a Python/OpenCV harness that uses the exported ONNX
-tracker likelihood model and the same fixed-pose marker geometry as Android.
+Use `neural` to mirror Android's acquire, precise verification, velocity seed,
+and tracking ascent without classical CV fallback.
 
 Example:
 
 ```powershell
 cd receiver/tools
-uv run python -m run_tracker_dataset.run_tracker_dataset --backend cv --tracker-model ..\models\tracker_likelihood\tracker_likelihood_fast_v003.onnx --overlay-out ..\datasets\derived\overlays\tracker_v003 --metrics-out ..\datasets\derived\metrics\tracker_v003
+uv run python -m run_tracker_dataset.run_tracker_dataset --backend neural --acquire-model ..\models\tracker_likelihood\tracker_likelihood_acquire_v005.onnx --precise-model ..\models\tracker_likelihood\tracker_likelihood_precise_v005.onnx --overlay-out ..\datasets\derived\overlays\neural_v005 --metrics-out ..\datasets\derived\metrics\neural_v005
 ```
 
 Use `--include good5 bad3` for focused iteration.

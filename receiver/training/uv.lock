@@ -655,6 +655,7 @@ source = { editable = "../tools" }
 dependencies = [
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "numpy", version = "2.5.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "onnx" },
     { name = "opencv-python" },
     { name = "tqdm" },
 ]
@@ -662,6 +663,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "numpy", specifier = ">=2.0.0" },
+    { name = "onnx", specifier = ">=1.16.0" },
     { name = "opencv-python", specifier = ">=4.10.0.84,<5" },
     { name = "tqdm", specifier = ">=4.66.0" },
 ]

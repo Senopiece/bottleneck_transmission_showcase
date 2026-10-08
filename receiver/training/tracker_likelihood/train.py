@@ -12,8 +12,14 @@ from tqdm import tqdm
 
 from receiver_tools.dataset import default_dataset_dir, repo_root_from_tools
 
-from tracker_likelihood.dataset import TrackerLikelihoodDataset, split_samples, synthetic_samples, video_mined_samples
-from tracker_likelihood.model import PATCH_CHANNELS, PATCH_HEIGHT, PATCH_WIDTH, create_model
+from tracker_likelihood.dataset import (
+    TrackerLikelihoodDataset,
+    configure_patch_size,
+    split_samples,
+    synthetic_samples,
+    video_mined_samples,
+)
+from tracker_likelihood.model import LIKELIHOOD_HEADS, PATCH_CHANNELS, PATCH_HEIGHT, PATCH_WIDTH, create_model
 
 
 def parse_args() -> argparse.Namespace:
@@ -23,7 +29,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--out",
         type=Path,
-        default=root / "receiver" / "models" / "tracker_likelihood" / "tracker_likelihood_fast_v003.pt",
+        default=root / "receiver" / "models" / "tracker_likelihood" / "tracker_likelihood_precise_v005.pt",
     )
     parser.add_argument("--synthetic-samples", type=int, default=12000)
     parser.add_argument("--real-max-frames", type=int, default=420)
@@ -37,6 +43,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--include", nargs="*", default=None, help="Optional video stems for weak-label mining.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda"))
+    parser.add_argument("--patch-width", type=int, default=PATCH_WIDTH)
+    parser.add_argument("--patch-height", type=int, default=PATCH_HEIGHT)
+    parser.add_argument("--broad-target-power", type=float, default=1.0)
     return parser.parse_args()
 
 
@@ -50,7 +59,7 @@ def pick_device(name: str) -> torch.device:
 
 def weighted_bce_loss(logits: torch.Tensor, target: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     loss = nn.functional.binary_cross_entropy_with_logits(logits, target, reduction="none")
-    return (loss * weight).sum() / torch.clamp(weight.sum(), min=1.0)
+    return (loss * weight[:, None]).sum() / torch.clamp(weight.sum() * LIKELIHOOD_HEADS, min=1.0)
 
 
 @torch.no_grad()
@@ -61,27 +70,39 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> dict
     correct = 0
     hard_count = 0
     soft_abs_error = 0.0
+    hard_positive: list[list[float]] = [[] for _ in range(LIKELIHOOD_HEADS)]
+    hard_negative: list[list[float]] = [[] for _ in range(LIKELIHOOD_HEADS)]
     for x, y, w in loader:
         x = x.to(device)
         y = y.to(device)
         w = w.to(device)
         logits = model(x)
         loss = nn.functional.binary_cross_entropy_with_logits(logits, y, reduction="none")
-        total_loss += float((loss * w).sum().item())
-        total_weight += float(w.sum().item())
+        total_loss += float((loss * w[:, None]).sum().item())
+        total_weight += float((w.sum() * LIKELIHOOD_HEADS).item())
         prob = torch.sigmoid(logits)
+        for head in range(LIKELIHOOD_HEADS):
+            hard_positive[head].extend(prob[y[:, head] >= 0.95, head].detach().cpu().tolist())
+            hard_negative[head].extend(prob[y[:, head] <= 0.05, head].detach().cpu().tolist())
         hard_mask = (y <= 0.05) | (y >= 0.95)
         if bool(hard_mask.any()):
             expected = y[hard_mask] >= 0.5
             actual = prob[hard_mask] >= 0.5
             correct += int((expected == actual).sum().item())
             hard_count += int(hard_mask.sum().item())
-        soft_abs_error += float((torch.abs(prob - y) * w).sum().item())
-    return {
+        soft_abs_error += float((torch.abs(prob - y) * w[:, None]).sum().item())
+    metrics = {
         "loss": total_loss / max(1.0, total_weight),
         "hard_accuracy": correct / max(1, hard_count),
         "weighted_mae": soft_abs_error / max(1.0, total_weight),
     }
+    for head, name in enumerate(("broad", "sharp")):
+        positive = np.asarray(hard_positive[head], dtype=np.float32)
+        negative = np.asarray(hard_negative[head], dtype=np.float32)
+        metrics[f"{name}_positive_p05"] = float(np.quantile(positive, 0.05)) if positive.size else 0.0
+        metrics[f"{name}_negative_p999"] = float(np.quantile(negative, 0.999)) if negative.size else 1.0
+        metrics[f"{name}_negative_max"] = float(negative.max()) if negative.size else 1.0
+    return metrics
 
 
 def main() -> None:
@@ -89,6 +110,7 @@ def main() -> None:
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     device = pick_device(args.device)
+    configure_patch_size(args.patch_width, args.patch_height)
 
     samples = []
     samples.extend(synthetic_samples(args.synthetic_samples, args.seed))
@@ -107,21 +129,31 @@ def main() -> None:
 
     train_samples, val_samples = split_samples(samples, args.validation_fraction, args.seed + 2)
     train_loader = DataLoader(
-        TrackerLikelihoodDataset(train_samples, augment=True, seed=args.seed + 3),
+        TrackerLikelihoodDataset(
+            train_samples,
+            augment=True,
+            seed=args.seed + 3,
+            broad_target_power=args.broad_target_power,
+        ),
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=0,
         pin_memory=device.type == "cuda",
     )
     val_loader = DataLoader(
-        TrackerLikelihoodDataset(val_samples, augment=False, seed=args.seed + 4),
+        TrackerLikelihoodDataset(
+            val_samples,
+            augment=False,
+            seed=args.seed + 4,
+            broad_target_power=args.broad_target_power,
+        ),
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=0,
         pin_memory=device.type == "cuda",
     )
 
-    model = create_model().to(device)
+    model = create_model(args.patch_width, args.patch_height).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, args.epochs))
 
@@ -153,7 +185,9 @@ def main() -> None:
         history.append(row)
         print(
             f"epoch={epoch} train={train_loss:.4f} val={val_metrics['loss']:.4f} "
-            f"acc={val_metrics['hard_accuracy']:.3f} mae={val_metrics['weighted_mae']:.4f}"
+            f"acc={val_metrics['hard_accuracy']:.3f} mae={val_metrics['weighted_mae']:.4f} "
+            f"sharp_pos05={val_metrics['sharp_positive_p05']:.3f} "
+            f"sharp_neg999={val_metrics['sharp_negative_p999']:.3f}"
         )
         if val_metrics["loss"] < best_val:
             best_val = val_metrics["loss"]
@@ -169,8 +203,8 @@ def save_checkpoint(path: Path, model: nn.Module, args: argparse.Namespace, hist
     torch.save(
         {
             "state_dict": model.state_dict(),
-            "arch": "FastMarkerLikelihoodNet",
-            "input_shape": [PATCH_CHANNELS, PATCH_HEIGHT, PATCH_WIDTH],
+            "arch": "FastMarkerLikelihoodNetSpatialDualHead",
+            "input_shape": [PATCH_CHANNELS, args.patch_height, args.patch_width],
             "args": vars(args),
             "history": history,
         },
@@ -180,8 +214,8 @@ def save_checkpoint(path: Path, model: nn.Module, args: argparse.Namespace, hist
     sidecar.write_text(
         json.dumps(
             {
-                "arch": "FastMarkerLikelihoodNet",
-                "input_shape": [PATCH_CHANNELS, PATCH_HEIGHT, PATCH_WIDTH],
+                "arch": "FastMarkerLikelihoodNetSpatialDualHead",
+                "input_shape": [PATCH_CHANNELS, args.patch_height, args.patch_width],
                 "args": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
                 "last_metrics": history[-1] if history else {},
             },

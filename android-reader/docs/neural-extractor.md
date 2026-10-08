@@ -4,8 +4,8 @@ This app now uses neural models only for the vision extractor:
 
 ```text
 camera frame
-  -> pose hypothesis ascent
-  -> tracker_likelihood.onnx
+  -> broad pose ascent with tracker_acquire.onnx
+  -> precise pose refinement/verification with tracker_precise.onnx
   -> accepted marker pose
   -> led_reader.onnx
   -> 5 soft LED scores
@@ -21,14 +21,16 @@ the existing Android receiver code.
 Model assets:
 
 ```text
-app/src/main/assets/tracker_likelihood.onnx
+app/src/main/assets/tracker_acquire.onnx
+app/src/main/assets/tracker_precise.onnx
 app/src/main/assets/led_reader.onnx
 ```
 
 They are copied from:
 
 ```text
-receiver/models/tracker_likelihood/tracker_likelihood_fast_v003.onnx
+receiver/models/tracker_likelihood/tracker_likelihood_acquire_v005.onnx
+receiver/models/tracker_likelihood/tracker_likelihood_precise_v005.onnx
 receiver/models/led_reader/led_reader_crop_v003_gate.onnx
 ```
 
@@ -36,17 +38,25 @@ Android inference uses ONNX Runtime Android.
 
 ## Tracker Model
 
-The tracker is a black-box likelihood function for one full marker pose:
+Both trackers score one full, geometrically fixed marker pose. Acquire input is
+`N x 2 x 24 x 64`; precise input is `N x 2 x 36 x 96`. Both output broad and
+sharp logits.
 
 ```text
-input:  patch, float32, 1 x 2 x 36 x 96
-output: likelihood_logit, float32, 1
+input:  patch, float32, N x 2 x H x W
+output: likelihood_logits, float32, N x 2
 ```
 
 Patch channels:
 
 1. normalized luma: per-patch mean/std, clipped to `[-3, 3] / 3`;
 2. edge magnitude: finite-difference gradient normalized by p95.
+
+The CNN head preserves its final spatial grid. Global average pooling is not
+used: it made endpoint locations too translation-invariant and caused broad pose
+optima. Acquire uses the broad `64 x 24` model. Every acquired candidate must
+then pass high-resolution sharp refinement/verification. Tracking uses the same
+precise model.
 
 The pose has exactly four degrees of freedom:
 
@@ -63,13 +73,16 @@ independently scaled or rotated.
 `LedFrameDecoder` runs a fixed-budget coordinate ascent:
 
 - acquire mode starts from the centered guide pose;
-- tracking mode starts from the previous accepted pose;
+- tracking mode scores both previous pose and a bounded constant-velocity
+  prediction, then keeps the better seed;
 - each step tests +/- x, +/- y, +/- angle, +/- log-distance;
-- score is `sigmoid(tracker_likelihood_logit)`;
+- all eight neighbors of one step are evaluated in one batched ONNX call;
+- each scale can take two improving coordinate moves before the step shrinks;
+- score is `sigmoid` of the acquire or tracking likelihood logit;
 - acquire and tracking use separate score thresholds.
 
-This is deliberately simple and bounded. The neural model makes the likelihood
-less sensitive to material glare and lighting, while the ascent remains cheap.
+No pose smoothing filter is used. Motion prediction only seeds likelihood
+ascent, and cannot override a better previous-pose score.
 
 ## LED Model
 
@@ -106,7 +119,9 @@ Debug builds can show:
 - acquire/tracking mode;
 - tracker score;
 - per-LED scores;
-- decoder timing.
+- total decoder timing;
+- tracker patch preparation and ONNX timing, including call/candidate counts;
+- LED patch preparation and ONNX timing.
 
 Release builds should keep debug overlays/logging behind compile-time flags.
 
@@ -138,11 +153,15 @@ patch dumps rather than tuning thresholds.
 
 ## Room For Improvement
 
-- Batch pose candidates into one tracker ONNX call per ascent step. The current
-  implementation is simpler and easier to verify, but one call per candidate has
-  avoidable runtime overhead.
+- Add a local pose-update head. It could support two or three recurrent
+  corrections instead of several coordinate-ascent neighborhoods, but must be
+  accepted from end-to-end pose and false-positive metrics rather than regression
+  loss alone.
+- Benchmark static int8 quantization of both spatial ReLU trackers.
+- Benchmark CPU thread counts and NNAPI after batching; tiny unbatched calls often
+  make accelerator dispatch slower rather than faster.
 - Add Android/Python canonical patch parity tests from saved frames.
-- Calibrate acquire/tracking thresholds from good/bad validation score distributions.
+- Expand manually verified pose labels beyond weak pseudo-labels.
 - Train the LED gate with more low-confidence tracked examples and downstream BP
   loss, not only per-crop weak labels.
 - Try int8 quantization or TFLite/NNAPI only after the floating ONNX baseline is

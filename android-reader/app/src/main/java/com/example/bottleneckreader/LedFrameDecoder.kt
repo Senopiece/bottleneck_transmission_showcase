@@ -63,6 +63,11 @@ class LedFrameDecoder(context: Context) {
         val triangle: Float,
     )
 
+    private enum class TrackerModelKind {
+        ACQUIRE,
+        PRECISE,
+    }
+
     private val constants = GeometryConstants()
     private val neural = NeuralVisionModels(context.applicationContext, constants)
 
@@ -72,6 +77,9 @@ class LedFrameDecoder(context: Context) {
         private set
 
     private var previousTheta: Theta? = null
+    private var previousPreviousTheta: Theta? = null
+    private var previousTimestampNs = 0L
+    private var previousPreviousTimestampNs = 0L
     private var previousScore = 0f
     private var missedFrames = 0
     private var debugModeLine = "mode: none"
@@ -85,8 +93,8 @@ class LedFrameDecoder(context: Context) {
         val reader = YuvReader(image)
         val searchArea = reader.rotatedSearchArea()
         beginDebugFrame()
+        neural.beginDebugFrame()
 
-        val seed = initialTheta(reader, searchArea)
         val tracking = previousTheta != null && missedFrames <= TRACKING_CONTINUITY_MISSES
         isAcquireMode = !tracking
         if (Diagnostics.enabled) {
@@ -97,37 +105,44 @@ class LedFrameDecoder(context: Context) {
             }
         }
 
-        var fit = refine(
+        var usedAcquire = !tracking
+        var fit = if (tracking) refine(
             reader = reader,
             searchArea = searchArea,
-            seed = seed,
-            steps = if (tracking) TRACKING_STEPS else ACQUIRE_STEPS,
-            trackingAcceptance = tracking,
-        )
+            seeds = trackingSeeds(reader.timestampNs),
+            steps = TRACKING_STEPS,
+            modelKind = TrackerModelKind.PRECISE,
+        ) else acquireAndVerify(reader, searchArea)
         if (tracking && !isAccepted(fit, tracking = true)) {
             isAcquireMode = true
+            usedAcquire = true
             if (Diagnostics.enabled) {
                 debugModeLine = "mode: tracking fallback prevScore=${fmt(previousScore)} missed=$missedFrames"
             }
-            fit = refine(
-                reader = reader,
-                searchArea = searchArea,
-                seed = centeredTheta(reader, searchArea),
-                steps = ACQUIRE_STEPS,
-                trackingAcceptance = false,
-            )
+            fit = acquireAndVerify(reader, searchArea)
         }
         if (!isAccepted(fit, tracking = !isAcquireMode)) {
             missedFrames++
             if (missedFrames >= RESET_AFTER_MISSES) {
                 previousTheta = null
+                previousPreviousTheta = null
+                previousTimestampNs = 0L
+                previousPreviousTimestampNs = 0L
                 previousScore = 0f
             }
             finishDebugFrame("MISS", fit)
             return null
         }
 
+        if (usedAcquire) {
+            previousPreviousTheta = null
+            previousPreviousTimestampNs = 0L
+        } else {
+            previousPreviousTheta = previousTheta
+            previousPreviousTimestampNs = previousTimestampNs
+        }
         previousTheta = fit.theta
+        previousTimestampNs = reader.timestampNs
         previousScore = fit.score
         missedFrames = 0
 
@@ -141,6 +156,9 @@ class LedFrameDecoder(context: Context) {
 
     fun resetTracking() {
         previousTheta = null
+        previousPreviousTheta = null
+        previousTimestampNs = 0L
+        previousPreviousTimestampNs = 0L
         previousScore = 0f
         missedFrames = 0
         lastDebugLines = emptyList()
@@ -172,6 +190,7 @@ class LedFrameDecoder(context: Context) {
         }
         lines.add(debugBestLine())
         lines.add(debugBitsLine)
+        lines.add(neural.debugTimingLine())
         lastDebugLines = lines
         return lines
     }
@@ -184,10 +203,54 @@ class LedFrameDecoder(context: Context) {
             " d=${fmt(debugBestDistanceInRoi)}"
     }
 
-    private fun initialTheta(reader: YuvReader, searchArea: RotatedSearchArea): Theta {
-        val previous = previousTheta
-        if (previous != null && missedFrames <= TRACKING_CONTINUITY_MISSES) return previous
-        return centeredTheta(reader, searchArea)
+    private fun acquireAndVerify(reader: YuvReader, searchArea: RotatedSearchArea): Fit {
+        val coarse = refine(
+            reader = reader,
+            searchArea = searchArea,
+            seeds = listOf(centeredTheta(reader, searchArea)),
+            steps = ACQUIRE_STEPS,
+            modelKind = TrackerModelKind.ACQUIRE,
+        )
+        if (coarse.score < MIN_COARSE_ACQUIRE_SCORE) return coarse
+        return refine(
+            reader = reader,
+            searchArea = searchArea,
+            seeds = listOf(coarse.theta),
+            steps = VERIFY_STEPS,
+            modelKind = TrackerModelKind.PRECISE,
+        )
+    }
+
+    private fun trackingSeeds(timestampNs: Long): List<Theta> {
+        val previous = requireNotNull(previousTheta)
+        val older = previousPreviousTheta ?: return listOf(previous)
+        val historyDt = previousTimestampNs - previousPreviousTimestampNs
+        val predictionDt = timestampNs - previousTimestampNs
+        if (historyDt <= 0L || predictionDt <= 0L) return listOf(previous)
+        val ratio = (predictionDt.toDouble() / historyDt.toDouble()).toFloat().coerceIn(0f, 2.2f)
+
+        var dx = (previous.cx - older.cx) * ratio
+        var dy = (previous.cy - older.cy) * ratio
+        val maxTranslation = previous.distance * MAX_PREDICTED_TRANSLATION_FRACTION
+        val translation = sqrt(dx * dx + dy * dy)
+        if (translation > maxTranslation && translation > 1e-4f) {
+            val scale = maxTranslation / translation
+            dx *= scale
+            dy *= scale
+        }
+        val angleDelta = (
+            normalizeAngle(previous.angle - older.angle) * ratio
+            ).coerceIn(-MAX_PREDICTED_ANGLE_RAD, MAX_PREDICTED_ANGLE_RAD)
+        val logDistanceDelta = (
+            (previous.logDistance - older.logDistance) * ratio
+            ).coerceIn(-MAX_PREDICTED_LOG_DISTANCE, MAX_PREDICTED_LOG_DISTANCE)
+        val predicted = previous.copy(
+            cx = previous.cx + dx,
+            cy = previous.cy + dy,
+            angle = previous.angle + angleDelta,
+            logDistance = previous.logDistance + logDistanceDelta,
+        )
+        return listOf(previous, predicted)
     }
 
     private fun centeredTheta(reader: YuvReader, searchArea: RotatedSearchArea): Theta {
@@ -209,55 +272,66 @@ class LedFrameDecoder(context: Context) {
     private fun refine(
         reader: YuvReader,
         searchArea: RotatedSearchArea,
-        seed: Theta,
+        seeds: List<Theta>,
         steps: Array<Step>,
-        trackingAcceptance: Boolean,
+        modelKind: TrackerModelKind,
     ): Fit {
         val guideWidth = reader.guideWidth()
-        val minLogDistance = ln(max(MIN_PATTERN_DISTANCE_PX, guideWidth * 0.58f))
+        val minLogDistance = ln(max(MIN_PATTERN_DISTANCE_PX, guideWidth * MIN_PATTERN_DISTANCE_FRACTION))
         val maxLogDistance = ln(guideWidth * 1.02f)
-        var theta = normalizeTheta(seed, minLogDistance, maxLogDistance)
-        var breakdown = scoreBreakdown(reader, searchArea, theta)
+        val normalizedSeeds = seeds.map { normalizeTheta(it, minLogDistance, maxLogDistance) }
+        val seedBreakdowns = scoreBreakdowns(reader, searchArea, normalizedSeeds, modelKind)
+        var seedIndex = 0
+        for (index in 1 until normalizedSeeds.size) {
+            if (seedBreakdowns[index].score > seedBreakdowns[seedIndex].score) seedIndex = index
+        }
+        var theta = normalizedSeeds[seedIndex]
+        var breakdown = seedBreakdowns[seedIndex]
         var score = breakdown.score
         var bestTheta = theta
         var bestBreakdown = breakdown
         var bestScore = score
 
         for (step in steps) {
-            var localBestTheta = theta
-            var localBestBreakdown = breakdown
-            var localBestScore = score
+            var pass = 0
+            while (pass < MAX_PASSES_PER_STEP) {
+                var localBestTheta = theta
+                var localBestBreakdown = breakdown
+                var localBestScore = score
 
-            fun tryCandidate(candidate: Theta) {
-                val normalized = normalizeTheta(candidate, minLogDistance, maxLogDistance)
-                val candidateBreakdown = scoreBreakdown(reader, searchArea, normalized)
-                val candidateScore = candidateBreakdown.score
-                if (candidateScore > localBestScore) {
-                    localBestScore = candidateScore
-                    localBestBreakdown = candidateBreakdown
-                    localBestTheta = normalized
+                val candidates = arrayOf(
+                theta.copy(cx = theta.cx + step.translationPx),
+                theta.copy(cx = theta.cx - step.translationPx),
+                theta.copy(cy = theta.cy + step.translationPx),
+                theta.copy(cy = theta.cy - step.translationPx),
+                theta.copy(angle = theta.angle + step.angleRad),
+                theta.copy(angle = theta.angle - step.angleRad),
+                theta.copy(logDistance = theta.logDistance + step.logDistance),
+                theta.copy(logDistance = theta.logDistance - step.logDistance),
+                ).map { normalizeTheta(it, minLogDistance, maxLogDistance) }
+                val candidateBreakdowns = scoreBreakdowns(reader, searchArea, candidates, modelKind)
+                for (index in candidates.indices) {
+                    val candidateBreakdown = candidateBreakdowns[index]
+                    val candidateScore = candidateBreakdown.score
+                    if (candidateScore > localBestScore + MIN_ASCENT_IMPROVEMENT) {
+                        localBestScore = candidateScore
+                        localBestBreakdown = candidateBreakdown
+                        localBestTheta = candidates[index]
+                    }
                 }
-            }
 
-            tryCandidate(theta.copy(cx = theta.cx + step.translationPx))
-            tryCandidate(theta.copy(cx = theta.cx - step.translationPx))
-            tryCandidate(theta.copy(cy = theta.cy + step.translationPx))
-            tryCandidate(theta.copy(cy = theta.cy - step.translationPx))
-            tryCandidate(theta.copy(angle = theta.angle + step.angleRad))
-            tryCandidate(theta.copy(angle = theta.angle - step.angleRad))
-            tryCandidate(theta.copy(logDistance = theta.logDistance + step.logDistance))
-            tryCandidate(theta.copy(logDistance = theta.logDistance - step.logDistance))
-
-            val improved = localBestScore > score
-            theta = localBestTheta
-            breakdown = localBestBreakdown
-            score = localBestScore
-            if (score > bestScore) {
-                bestScore = score
-                bestTheta = theta
-                bestBreakdown = breakdown
+                val improved = localBestScore > score + MIN_ASCENT_IMPROVEMENT
+                theta = localBestTheta
+                breakdown = localBestBreakdown
+                score = localBestScore
+                if (score > bestScore) {
+                    bestScore = score
+                    bestTheta = theta
+                    bestBreakdown = breakdown
+                }
+                if (!improved) break
+                pass++
             }
-            if (!improved && isAccepted(bestScore, tracking = trackingAcceptance)) break
         }
 
         return Fit(bestTheta, bestBreakdown)
@@ -279,30 +353,42 @@ class LedFrameDecoder(context: Context) {
         return score >= minScore
     }
 
-    private fun scoreBreakdown(reader: YuvReader, searchArea: RotatedSearchArea, theta: Theta): ScoreBreakdown {
-        val model = modelForTheta(theta)
-        if (!modelInsideSearchArea(reader, searchArea, model)) {
-            return ScoreBreakdown(BAD_SCORE, 0f, 0f)
+    private fun scoreBreakdowns(
+        reader: YuvReader,
+        searchArea: RotatedSearchArea,
+        thetas: List<Theta>,
+        modelKind: TrackerModelKind,
+    ): Array<ScoreBreakdown> {
+        val results = Array(thetas.size) { ScoreBreakdown(BAD_SCORE, 0f, 0f) }
+        val validIndices = ArrayList<Int>(thetas.size)
+        val validModels = ArrayList<PatternModel>(thetas.size)
+        for (index in thetas.indices) {
+            val model = modelForTheta(thetas[index])
+            if (modelInsideSearchArea(reader, searchArea, model)) {
+                validIndices.add(index)
+                validModels.add(model)
+            }
         }
+        if (validModels.isEmpty()) return results
 
-        val likelihood = neural.trackerLikelihood(reader, model)
-        val square = likelihood
-        val triangle = likelihood
-        val markerDistanceInGuide = model.distancePx / reader.guideWidth()
-
-        val score = likelihood
-
-        if (Diagnostics.enabled && score > debugBestScore) {
-            debugBestScore = score
-            debugBestSquare = square
-            debugBestTriangle = triangle
-            debugBestDistanceInRoi = markerDistanceInGuide
+        val likelihoods = neural.trackerLikelihoods(reader, validModels, modelKind)
+        val guideWidth = reader.guideWidth()
+        for (validIndex in validModels.indices) {
+            val likelihood = likelihoods[validIndex]
+            val model = validModels[validIndex]
+            results[validIndices[validIndex]] = ScoreBreakdown(
+                score = likelihood,
+                square = likelihood,
+                triangle = likelihood,
+            )
+            if (Diagnostics.enabled && likelihood > debugBestScore) {
+                debugBestScore = likelihood
+                debugBestSquare = likelihood
+                debugBestTriangle = likelihood
+                debugBestDistanceInRoi = model.distancePx / guideWidth
+            }
         }
-        return ScoreBreakdown(
-            score = score,
-            square = square,
-            triangle = triangle,
-        )
+        return results
     }
 
     private fun modelForTheta(theta: Theta): PatternModel {
@@ -499,62 +585,84 @@ class LedFrameDecoder(context: Context) {
             )
         }
 
-        fun y(x: Int, y: Int): Int {
-            return yBuffer.get(y * yRowStride + x).toInt() and 0xff
-        }
-
-        fun u(x: Int, y: Int): Int {
-            return uBuffer.get((y / 2) * uRowStride + (x / 2) * uPixelStride).toInt() and 0xff
-        }
-
-        fun v(x: Int, y: Int): Int {
-            return vBuffer.get((y / 2) * vRowStride + (x / 2) * vPixelStride).toInt() and 0xff
-        }
-
         fun yBilinear(x: Float, y: Float): Float {
-            return bilinear(
-                x = x,
-                y = y,
-                maxX = width - 1,
-                maxY = height - 1,
-            ) { xi, yi -> this.y(xi, yi).toFloat() }
+            val clampedX = x.coerceIn(0f, (width - 1).toFloat())
+            val clampedY = y.coerceIn(0f, (height - 1).toFloat())
+            val x0 = clampedX.toInt()
+            val y0 = clampedY.toInt()
+            val x1 = (x0 + 1).coerceAtMost(width - 1)
+            val y1 = (y0 + 1).coerceAtMost(height - 1)
+            return interpolatePlane(
+                buffer = yBuffer,
+                rowStride = yRowStride,
+                pixelStride = 1,
+                x0 = x0,
+                y0 = y0,
+                x1 = x1,
+                y1 = y1,
+                fx = clampedX - x0,
+                fy = clampedY - y0,
+                subsample = false,
+            )
         }
 
         fun uBilinear(x: Float, y: Float): Float {
-            return bilinear(
-                x = x,
-                y = y,
-                maxX = width - 1,
-                maxY = height - 1,
-            ) { xi, yi -> this.u(xi, yi).toFloat() }
+            return chromaBilinear(uBuffer, uRowStride, uPixelStride, x, y)
         }
 
         fun vBilinear(x: Float, y: Float): Float {
-            return bilinear(
-                x = x,
-                y = y,
-                maxX = width - 1,
-                maxY = height - 1,
-            ) { xi, yi -> this.v(xi, yi).toFloat() }
+            return chromaBilinear(vBuffer, vRowStride, vPixelStride, x, y)
         }
 
-        private fun bilinear(
+        private fun chromaBilinear(
+            buffer: ByteBuffer,
+            rowStride: Int,
+            pixelStride: Int,
             x: Float,
             y: Float,
-            maxX: Int,
-            maxY: Int,
-            sample: (Int, Int) -> Float,
         ): Float {
-            val clampedX = x.coerceIn(0f, maxX.toFloat())
-            val clampedY = y.coerceIn(0f, maxY.toFloat())
-            val x0 = clampedX.toInt().coerceIn(0, maxX)
-            val y0 = clampedY.toInt().coerceIn(0, maxY)
-            val x1 = (x0 + 1).coerceAtMost(maxX)
-            val y1 = (y0 + 1).coerceAtMost(maxY)
-            val fx = clampedX - x0
-            val fy = clampedY - y0
-            val top = sample(x0, y0) * (1f - fx) + sample(x1, y0) * fx
-            val bottom = sample(x0, y1) * (1f - fx) + sample(x1, y1) * fx
+            val clampedX = x.coerceIn(0f, (width - 1).toFloat())
+            val clampedY = y.coerceIn(0f, (height - 1).toFloat())
+            val x0 = clampedX.toInt()
+            val y0 = clampedY.toInt()
+            val x1 = (x0 + 1).coerceAtMost(width - 1)
+            val y1 = (y0 + 1).coerceAtMost(height - 1)
+            return interpolatePlane(
+                buffer = buffer,
+                rowStride = rowStride,
+                pixelStride = pixelStride,
+                x0 = x0,
+                y0 = y0,
+                x1 = x1,
+                y1 = y1,
+                fx = clampedX - x0,
+                fy = clampedY - y0,
+                subsample = true,
+            )
+        }
+
+        private fun interpolatePlane(
+            buffer: ByteBuffer,
+            rowStride: Int,
+            pixelStride: Int,
+            x0: Int,
+            y0: Int,
+            x1: Int,
+            y1: Int,
+            fx: Float,
+            fy: Float,
+            subsample: Boolean,
+        ): Float {
+            val sx0 = if (subsample) x0 / 2 else x0
+            val sx1 = if (subsample) x1 / 2 else x1
+            val sy0 = if (subsample) y0 / 2 else y0
+            val sy1 = if (subsample) y1 / 2 else y1
+            val p00 = (buffer.get(sy0 * rowStride + sx0 * pixelStride).toInt() and 0xff).toFloat()
+            val p10 = (buffer.get(sy0 * rowStride + sx1 * pixelStride).toInt() and 0xff).toFloat()
+            val p01 = (buffer.get(sy1 * rowStride + sx0 * pixelStride).toInt() and 0xff).toFloat()
+            val p11 = (buffer.get(sy1 * rowStride + sx1 * pixelStride).toInt() and 0xff).toFloat()
+            val top = p00 * (1f - fx) + p10 * fx
+            val bottom = p01 * (1f - fx) + p11 * fx
             return top * (1f - fy) + bottom * fy
         }
     }
@@ -585,33 +693,71 @@ class LedFrameDecoder(context: Context) {
         context: Context,
         private val constants: GeometryConstants,
     ) {
+        private var trackerPrepNs = 0L
+        private var trackerInferenceNs = 0L
+        private var trackerCalls = 0
+        private var trackerCandidates = 0
+        private var ledPrepNs = 0L
+        private var ledInferenceNs = 0L
         private val env: OrtEnvironment = OrtEnvironment.getEnvironment()
         private val sessionOptions = OrtSession.SessionOptions().apply {
-            setOptimizationLevel(OrtSession.SessionOptions.OptLevel.BASIC_OPT)
+            setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
             setIntraOpNumThreads(1)
         }
-        private val trackerSession: OrtSession = env.createSession(
-            context.assets.open(TRACKER_MODEL_ASSET).use { it.readBytes() },
-            sessionOptions,
+        private val acquireTracker = TrackerRuntime(
+            modelBytes = context.assets.open(ACQUIRE_TRACKER_MODEL_ASSET).use { it.readBytes() },
+            width = ACQUIRE_TRACKER_PATCH_W,
+            height = ACQUIRE_TRACKER_PATCH_H,
+        )
+        private val preciseTracker = TrackerRuntime(
+            modelBytes = context.assets.open(PRECISE_TRACKER_MODEL_ASSET).use { it.readBytes() },
+            width = PRECISE_TRACKER_PATCH_W,
+            height = PRECISE_TRACKER_PATCH_H,
         )
         private val ledSession: OrtSession = env.createSession(
             context.assets.open(LED_MODEL_ASSET).use { it.readBytes() },
             sessionOptions,
         )
 
-        fun trackerLikelihood(reader: YuvReader, model: PatternModel): Float {
-            val input = markerTensor(reader, model)
-            OnnxTensor.createTensor(env, FloatBuffer.wrap(input), longArrayOf(1, 2, TRACKER_PATCH_H.toLong(), TRACKER_PATCH_W.toLong())).use { tensor ->
-                trackerSession.run(mapOf("patch" to tensor)).use { result ->
-                    val logit = firstFloat(result[0].value)
-                    return sigmoid(logit)
-                }
-            }
+        fun beginDebugFrame() {
+            if (!Diagnostics.enabled) return
+            trackerPrepNs = 0L
+            trackerInferenceNs = 0L
+            trackerCalls = 0
+            trackerCandidates = 0
+            ledPrepNs = 0L
+            ledInferenceNs = 0L
+        }
+
+        fun debugTimingLine(): String {
+            if (!Diagnostics.enabled) return ""
+            return String.format(
+                Locale.US,
+                "vision trPrep=%.1f trOrt=%.1f calls=%d n=%d ledPrep=%.1f ledOrt=%.1f",
+                trackerPrepNs / 1_000_000.0,
+                trackerInferenceNs / 1_000_000.0,
+                trackerCalls,
+                trackerCandidates,
+                ledPrepNs / 1_000_000.0,
+                ledInferenceNs / 1_000_000.0,
+            )
+        }
+
+        fun trackerLikelihoods(
+            reader: YuvReader,
+            models: List<PatternModel>,
+            modelKind: TrackerModelKind,
+        ): FloatArray {
+            val runtime = if (modelKind == TrackerModelKind.ACQUIRE) acquireTracker else preciseTracker
+            return runtime.likelihoods(reader, models, sharpLikelihood = modelKind == TrackerModelKind.PRECISE)
         }
 
         fun ledScores(reader: YuvReader, model: PatternModel, detectorLikelihood: Float): FloatArray {
+            val prepStarted = if (Diagnostics.enabled) System.nanoTime() else 0L
             val input = ledTensor(reader, model)
             val likelihood = FloatArray(LED_COUNT) { detectorLikelihood.coerceIn(0f, 1f) }
+            if (Diagnostics.enabled) ledPrepNs += System.nanoTime() - prepStarted
+            val inferenceStarted = if (Diagnostics.enabled) System.nanoTime() else 0L
             OnnxTensor.createTensor(env, FloatBuffer.wrap(input), longArrayOf(LED_COUNT.toLong(), 3, LED_PATCH.toLong(), LED_PATCH.toLong())).use { cropTensor ->
                 OnnxTensor.createTensor(env, FloatBuffer.wrap(likelihood), longArrayOf(LED_COUNT.toLong())).use { likelihoodTensor ->
                     ledSession.run(
@@ -620,6 +766,7 @@ class LedFrameDecoder(context: Context) {
                             "detector_likelihood" to likelihoodTensor,
                         ),
                     ).use { result ->
+                        if (Diagnostics.enabled) ledInferenceNs += System.nanoTime() - inferenceStarted
                         val logits = floats(result[0].value, LED_COUNT)
                         return FloatArray(LED_COUNT) { index ->
                             // PacketClockDecoder consumes the old score scale:
@@ -631,22 +778,74 @@ class LedFrameDecoder(context: Context) {
             }
         }
 
-        private fun markerTensor(reader: YuvReader, model: PatternModel): FloatArray {
-            val count = TRACKER_PATCH_W * TRACKER_PATCH_H
-            val luma = FloatArray(count)
-            for (y in 0 until TRACKER_PATCH_H) {
-                val localY = ((y.toFloat() / (TRACKER_PATCH_H - 1)) - 0.5f) * MARKER_PATCH_LOCAL_H
-                for (x in 0 until TRACKER_PATCH_W) {
-                    val localX = ((x.toFloat() / (TRACKER_PATCH_W - 1)) - 0.5f) * MARKER_PATCH_LOCAL_W
-                    luma[y * TRACKER_PATCH_W + x] = sampleLuma(reader, model, localX, localY) / 255f
+        private inner class TrackerRuntime(
+            modelBytes: ByteArray,
+            private val width: Int,
+            private val height: Int,
+        ) {
+            private val session = env.createSession(modelBytes, sessionOptions)
+            private val inputScratch = FloatArray(MAX_TRACKER_BATCH * 2 * width * height)
+            private val lumaScratch = FloatArray(width * height)
+            private val percentileScratch = FloatArray(width * height)
+            private val localX = FloatArray(width * height) { index ->
+                val x = index % width
+                ((x.toFloat() / (width - 1)) - 0.5f) * MARKER_PATCH_LOCAL_W
+            }
+            private val localY = FloatArray(width * height) { index ->
+                val y = index / width
+                ((y.toFloat() / (height - 1)) - 0.5f) * MARKER_PATCH_LOCAL_H
+            }
+
+            fun likelihoods(
+                reader: YuvReader,
+                models: List<PatternModel>,
+                sharpLikelihood: Boolean,
+            ): FloatArray {
+                require(models.isNotEmpty())
+                require(models.size <= MAX_TRACKER_BATCH)
+                val prepStarted = if (Diagnostics.enabled) System.nanoTime() else 0L
+                val input = markerTensor(reader, models)
+                if (Diagnostics.enabled) {
+                    trackerPrepNs += System.nanoTime() - prepStarted
+                    trackerCalls++
+                    trackerCandidates += models.size
+                }
+                val inputSize = models.size * 2 * height * width
+                val inferenceStarted = if (Diagnostics.enabled) System.nanoTime() else 0L
+                OnnxTensor.createTensor(
+                    env,
+                    FloatBuffer.wrap(input, 0, inputSize),
+                    longArrayOf(models.size.toLong(), 2, height.toLong(), width.toLong()),
+                ).use { tensor ->
+                    session.run(mapOf("patch" to tensor)).use { result ->
+                        if (Diagnostics.enabled) trackerInferenceNs += System.nanoTime() - inferenceStarted
+                        val logits = trackerLogits(result[0].value, models.size, sharpLikelihood)
+                        return FloatArray(models.size) { index -> sigmoid(logits[index]) }
+                    }
                 }
             }
-            val normalized = normalizedLuma(luma)
-            val edge = edgeChannel(luma, TRACKER_PATCH_W, TRACKER_PATCH_H)
-            val out = FloatArray(2 * count)
-            System.arraycopy(normalized, 0, out, 0, count)
-            System.arraycopy(edge, 0, out, count, count)
-            return out
+
+            private fun markerTensor(reader: YuvReader, models: List<PatternModel>): FloatArray {
+                val count = width * height
+                val perModel = 2 * count
+                for (modelIndex in models.indices) {
+                    val model = models[modelIndex]
+                    for (index in 0 until count) {
+                        lumaScratch[index] = sampleLuma(reader, model, localX[index], localY[index]) / 255f
+                    }
+                    val base = modelIndex * perModel
+                    normalizedLumaInto(lumaScratch, inputScratch, base)
+                    edgeChannelInto(
+                        luma = lumaScratch,
+                        width = width,
+                        height = height,
+                        out = inputScratch,
+                        outOffset = base + count,
+                        percentileScratch = percentileScratch,
+                    )
+                }
+                return inputScratch
+            }
         }
 
         private fun ledTensor(reader: YuvReader, model: PatternModel): FloatArray {
@@ -679,6 +878,12 @@ class LedFrameDecoder(context: Context) {
         }
 
         private fun normalizedLuma(luma: FloatArray): FloatArray {
+            val out = FloatArray(luma.size)
+            normalizedLumaInto(luma, out, 0)
+            return out
+        }
+
+        private fun normalizedLumaInto(luma: FloatArray, out: FloatArray, outOffset: Int) {
             var sum = 0f
             for (value in luma) sum += value
             val mean = sum / luma.size
@@ -688,11 +893,26 @@ class LedFrameDecoder(context: Context) {
                 variance += d * d
             }
             val std = sqrt(variance / luma.size).coerceAtLeast(1e-4f)
-            return FloatArray(luma.size) { index -> ((luma[index] - mean) / std).coerceIn(-3f, 3f) / 3f }
+            for (index in luma.indices) {
+                out[outOffset + index] = ((luma[index] - mean) / std).coerceIn(-3f, 3f) / 3f
+            }
         }
 
         private fun edgeChannel(luma: FloatArray, width: Int, height: Int): FloatArray {
             val edge = FloatArray(luma.size)
+            val percentileScratch = FloatArray(luma.size)
+            edgeChannelInto(luma, width, height, edge, 0, percentileScratch)
+            return edge
+        }
+
+        private fun edgeChannelInto(
+            luma: FloatArray,
+            width: Int,
+            height: Int,
+            out: FloatArray,
+            outOffset: Int,
+            percentileScratch: FloatArray,
+        ) {
             for (y in 0 until height) {
                 val ym = (y - 1).coerceAtLeast(0)
                 val yp = (y + 1).coerceAtMost(height - 1)
@@ -701,14 +921,44 @@ class LedFrameDecoder(context: Context) {
                     val xp = (x + 1).coerceAtMost(width - 1)
                     val gx = luma[y * width + xp] - luma[y * width + xm]
                     val gy = luma[yp * width + x] - luma[ym * width + x]
-                    edge[y * width + x] = sqrt(gx * gx + gy * gy)
+                    out[outOffset + y * width + x] = sqrt(gx * gx + gy * gy)
                 }
             }
-            val sorted = edge.copyOf()
-            sorted.sort()
-            val p95 = sorted[(sorted.size * 95 / 100).coerceIn(0, sorted.lastIndex)].coerceAtLeast(1e-4f)
-            for (index in edge.indices) edge[index] = (edge[index] / p95).coerceIn(0f, 1f)
-            return edge
+            for (index in luma.indices) percentileScratch[index] = out[outOffset + index]
+            val p95 = selectKth(
+                percentileScratch,
+                (percentileScratch.size * 95 / 100).coerceIn(0, percentileScratch.lastIndex),
+            ).coerceAtLeast(1e-4f)
+            for (index in luma.indices) {
+                out[outOffset + index] = (out[outOffset + index] / p95).coerceIn(0f, 1f)
+            }
+        }
+
+        private fun selectKth(values: FloatArray, target: Int): Float {
+            var left = 0
+            var right = values.lastIndex
+            while (left < right) {
+                val pivot = values[(left + right) ushr 1]
+                var i = left
+                var j = right
+                while (i <= j) {
+                    while (values[i] < pivot) i++
+                    while (values[j] > pivot) j--
+                    if (i <= j) {
+                        val tmp = values[i]
+                        values[i] = values[j]
+                        values[j] = tmp
+                        i++
+                        j--
+                    }
+                }
+                when {
+                    target <= j -> right = j
+                    target >= i -> left = i
+                    else -> return values[target]
+                }
+            }
+            return values[left]
         }
 
         private fun sampleLuma(reader: YuvReader, model: PatternModel, localX: Float, localY: Float): Float {
@@ -742,10 +992,6 @@ class LedFrameDecoder(context: Context) {
             return (1f / (1f + exp(-clamped)))
         }
 
-        private fun firstFloat(value: Any): Float {
-            return floats(value, 1)[0]
-        }
-
         private fun floats(value: Any, expected: Int): FloatArray {
             return when (value) {
                 is FloatArray -> value.copyOf(expected)
@@ -760,21 +1006,54 @@ class LedFrameDecoder(context: Context) {
             }
         }
 
+        private fun trackerLogits(value: Any, batchSize: Int, sharpLikelihood: Boolean): FloatArray {
+            val head = if (sharpLikelihood) 1 else 0
+            return when (value) {
+                is FloatArray -> {
+                    val heads = (value.size / batchSize).coerceAtLeast(1)
+                    FloatArray(batchSize) { index -> value[index * heads + head.coerceAtMost(heads - 1)] }
+                }
+                is Array<*> -> FloatArray(batchSize) { index ->
+                    when (val row = value[index]) {
+                        is FloatArray -> row[head.coerceAtMost(row.lastIndex)]
+                        is Array<*> -> (row[head.coerceAtMost(row.lastIndex)] as Number).toFloat()
+                        is Number -> row.toFloat()
+                        else -> 0f
+                    }
+                }
+                else -> FloatArray(batchSize)
+            }
+        }
+
         private data class RgbPixel(val r: Float, val g: Float, val b: Float, val luma: Float)
+
+        private companion object {
+            const val MAX_TRACKER_BATCH = 8
+        }
     }
 
     private companion object {
         const val RESET_AFTER_MISSES = 4
-        const val TRACKING_CONTINUITY_MISSES = 1
+        const val TRACKING_CONTINUITY_MISSES = RESET_AFTER_MISSES - 1
+        const val MAX_PASSES_PER_STEP = 2
+        const val MIN_ASCENT_IMPROVEMENT = 0.0015f
+        const val MAX_PREDICTED_TRANSLATION_FRACTION = 0.12f
+        const val MAX_PREDICTED_ANGLE_RAD = 0.12f
+        const val MAX_PREDICTED_LOG_DISTANCE = 0.08f
         const val MIN_TRACKING_ACCEPT_SCORE = 0.56f
-        const val MIN_ACQUIRE_ACCEPT_SCORE = 0.72f
+        const val MIN_ACQUIRE_ACCEPT_SCORE = 0.56f
+        const val MIN_COARSE_ACQUIRE_SCORE = 0.30f
         const val INITIAL_PATTERN_DISTANCE_FRACTION = 0.82f
         const val MIN_PATTERN_DISTANCE_PX = 32f
+        const val MIN_PATTERN_DISTANCE_FRACTION = 0.30f
         const val BAD_SCORE = -1_000_000f
-        const val TRACKER_MODEL_ASSET = "tracker_likelihood.onnx"
+        const val ACQUIRE_TRACKER_MODEL_ASSET = "tracker_acquire.onnx"
+        const val PRECISE_TRACKER_MODEL_ASSET = "tracker_precise.onnx"
         const val LED_MODEL_ASSET = "led_reader.onnx"
-        const val TRACKER_PATCH_W = 96
-        const val TRACKER_PATCH_H = 36
+        const val ACQUIRE_TRACKER_PATCH_W = 64
+        const val ACQUIRE_TRACKER_PATCH_H = 24
+        const val PRECISE_TRACKER_PATCH_W = 96
+        const val PRECISE_TRACKER_PATCH_H = 36
         const val LED_PATCH = 28
         const val LED_COUNT = 5
         const val MARKER_PATCH_LOCAL_W = 1.35f
@@ -784,18 +1063,23 @@ class LedFrameDecoder(context: Context) {
         const val LED_CROP_SOURCE_SIDE = 29f
 
         val ACQUIRE_STEPS = arrayOf(
-            Step(14f, (5.2f * PI / 180.0).toFloat(), 0.060f),
-            Step(8f, (3.0f * PI / 180.0).toFloat(), 0.034f),
-            Step(4.5f, (1.7f * PI / 180.0).toFloat(), 0.020f),
-            Step(2.4f, (0.9f * PI / 180.0).toFloat(), 0.012f),
-            Step(1.2f, (0.45f * PI / 180.0).toFloat(), 0.006f),
-            Step(0.65f, (0.24f * PI / 180.0).toFloat(), 0.003f),
+            Step(32f, (5.2f * PI / 180.0).toFloat(), 0.120f),
+            Step(18f, (3.0f * PI / 180.0).toFloat(), 0.075f),
+            Step(10f, (1.7f * PI / 180.0).toFloat(), 0.045f),
+            Step(5.5f, (0.9f * PI / 180.0).toFloat(), 0.025f),
+            Step(3f, (0.45f * PI / 180.0).toFloat(), 0.012f),
+            Step(1.5f, (0.24f * PI / 180.0).toFloat(), 0.006f),
         )
         val TRACKING_STEPS = arrayOf(
-            Step(5.5f, (2.0f * PI / 180.0).toFloat(), 0.024f),
+            Step(9f, (3.0f * PI / 180.0).toFloat(), 0.035f),
+            Step(4.5f, (1.5f * PI / 180.0).toFloat(), 0.018f),
+            Step(2.2f, (0.7f * PI / 180.0).toFloat(), 0.008f),
+            Step(1f, (0.3f * PI / 180.0).toFloat(), 0.0035f),
+        )
+        val VERIFY_STEPS = arrayOf(
             Step(3.0f, (1.1f * PI / 180.0).toFloat(), 0.014f),
-            Step(1.6f, (0.55f * PI / 180.0).toFloat(), 0.007f),
-            Step(0.8f, (0.28f * PI / 180.0).toFloat(), 0.0035f),
+            Step(1.5f, (0.55f * PI / 180.0).toFloat(), 0.007f),
+            Step(0.7f, (0.25f * PI / 180.0).toFloat(), 0.003f),
         )
     }
 }

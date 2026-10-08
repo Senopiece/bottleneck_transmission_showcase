@@ -30,9 +30,11 @@ and canonical geometry, not shared KMP/C++ code.
 
 Tracker likelihood:
 
-- input: canonical marker hypothesis patch, shape `1 x 2 x 36 x 96`;
+- acquire input: `N x 2 x 24 x 64`;
+- precise verify/tracking input: `N x 2 x 36 x 96`;
 - channels: normalized luma and normalized edge magnitude;
-- output: one logit estimating whether `(x, y, angle, scale)` is a valid pattern pose.
+- output: broad and sharp logits for `(x, y, angle, scale)`;
+- spatial head retains canonical endpoint layout instead of averaging it away.
 
 LED reader:
 
@@ -43,7 +45,8 @@ LED reader:
 The Android app stores the exported models in:
 
 ```text
-android-reader/app/src/main/assets/tracker_likelihood.onnx
+android-reader/app/src/main/assets/tracker_acquire.onnx
+android-reader/app/src/main/assets/tracker_precise.onnx
 android-reader/app/src/main/assets/led_reader.onnx
 ```
 
@@ -54,11 +57,13 @@ For every camera frame:
 1. The Android decoder builds an initial pose hypothesis:
    - previous pose in tracking mode;
    - centered guide pose in acquire mode.
-2. A small fixed-budget coordinate ascent searches `(x, y, angle, scale)`.
-3. Each candidate pose is warped into the canonical tracker patch and scored by ONNX Runtime.
-4. If the score clears the acquire/tracking threshold, the same pose yields five canonical LED crops.
-5. The LED ONNX model emits soft scores.
-6. Existing Android code handles preamble detection, clock inference, weighted symbol sampling, and BP/fountain message recovery.
+2. Small-model ascent finds a broad acquire candidate.
+3. High-resolution spatial likelihood refines and verifies it.
+4. Tracking scores previous and bounded velocity-predicted seeds, then runs
+   precise local ascent.
+5. Accepted pose yields five canonical LED crops.
+6. The LED ONNX model emits soft scores.
+7. Existing Android code handles preamble detection, clock inference, weighted symbol sampling, and BP/fountain message recovery.
 
 ## How To Run
 
@@ -76,8 +81,8 @@ Train/export tracker:
 
 ```powershell
 cd receiver/training
-uv run python -m tracker_likelihood.train --out ..\models\tracker_likelihood\tracker_likelihood_fast_v003.pt
-uv run python -m tracker_likelihood.export_onnx --checkpoint ..\models\tracker_likelihood\tracker_likelihood_fast_v003.pt --out ..\models\tracker_likelihood\tracker_likelihood_fast_v003.onnx
+uv run python -m tracker_likelihood.train --patch-width 64 --patch-height 24 --out ..\models\tracker_likelihood\tracker_likelihood_acquire_v005.pt
+uv run python -m tracker_likelihood.train --patch-width 96 --patch-height 36 --out ..\models\tracker_likelihood\tracker_likelihood_precise_v005.pt
 ```
 
 Train/export LED reader:
@@ -92,20 +97,21 @@ Render tracker overlays:
 
 ```powershell
 cd receiver/tools
-uv run python -m run_tracker_dataset.run_tracker_dataset --backend cv --tracker-model ..\models\tracker_likelihood\tracker_likelihood_fast_v003.onnx --overlay-out ..\datasets\derived\overlays\tracker_v003 --metrics-out ..\datasets\derived\metrics\tracker_v003
+uv run python -m run_tracker_dataset.run_tracker_dataset --backend neural --acquire-model ..\models\tracker_likelihood\tracker_likelihood_acquire_v005.onnx --precise-model ..\models\tracker_likelihood\tracker_likelihood_precise_v005.onnx
 ```
 
 Render LED reader overlays:
 
 ```powershell
 cd receiver/tools
-uv run python -m evaluate.eval_led_reader --tracker-model ..\models\tracker_likelihood\tracker_likelihood_fast_v003.onnx --model ..\models\led_reader\led_reader_crop_v003_gate.onnx --out ..\datasets\derived\overlays\led_reader_v003_gate
+uv run python -m evaluate.eval_led_reader --tracker-model ..\models\tracker_likelihood\tracker_likelihood_fast_v004.onnx --model ..\models\led_reader\led_reader_crop_v003_gate.onnx --out ..\datasets\derived\overlays\led_reader_v003_gate
 ```
 
 Copy models into Android:
 
 ```powershell
-Copy-Item receiver\models\tracker_likelihood\tracker_likelihood_fast_v003.onnx android-reader\app\src\main\assets\tracker_likelihood.onnx -Force
+Copy-Item receiver\models\tracker_likelihood\tracker_likelihood_acquire_v005.onnx android-reader\app\src\main\assets\tracker_acquire.onnx -Force
+Copy-Item receiver\models\tracker_likelihood\tracker_likelihood_precise_v005.onnx android-reader\app\src\main\assets\tracker_precise.onnx -Force
 Copy-Item receiver\models\led_reader\led_reader_crop_v003_gate.onnx android-reader\app\src\main\assets\led_reader.onnx -Force
 ```
 

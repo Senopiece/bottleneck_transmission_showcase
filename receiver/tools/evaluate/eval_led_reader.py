@@ -147,7 +147,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Render LED scorer predictions on tracked videos.")
     parser.add_argument("--dataset", type=Path, default=default_dataset_dir())
     parser.add_argument("--model", type=Path, default=root / "receiver" / "models" / "led_reader" / "led_reader_crop_v003_gate.onnx")
-    parser.add_argument("--tracker-model", type=Path, default=root / "receiver" / "models" / "tracker_likelihood" / "tracker_likelihood_fast_v003.onnx")
+    parser.add_argument("--tracker-model", type=Path, default=root / "receiver" / "models" / "tracker_likelihood" / "tracker_likelihood_fast_v004.onnx")
     parser.add_argument("--out", type=Path, default=default_derived_dir() / "overlays" / "led_reader_v003_gate")
     parser.add_argument("--include", nargs="*", default=None)
     parser.add_argument("--kind", choices=("good", "bad", "all"), default="good")
